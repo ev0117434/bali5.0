@@ -1,0 +1,9 @@
+# Python cache
+__pycache__/
+*.pyc
+*.pyo
+
+# Generated data files
+dictionaries/*/data/
+dictionaries/combination/
+dictionaries/subscribe/

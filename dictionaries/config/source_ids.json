@@ -1,0 +1,12 @@
+{
+  "binance_futures": 0,
+  "binance_spot": 1,
+  "bitget_futures": 2,
+  "bitget_spot": 3,
+  "bybit_futures": 4,
+  "bybit_spot": 5,
+  "gate_futures": 6,
+  "gate_spot": 7,
+  "okx_futures": 8,
+  "okx_spot": 9
+}
