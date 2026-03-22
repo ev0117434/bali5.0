@@ -196,12 +196,22 @@ class TestChunkId:
 # ── Buffer writer unit tests ───────────────────────────────────────────────
 
 class TestBufferWriters:
+    _original_history_enabled = None
+
     def setup_method(self):
         """Reset shared state before each test."""
         import collectors.collector_binance as cb
+        import config
         cb.batch_buffer.clear()
         cb.hist_buffer.clear()
         cb.cmd_counter = 0
+        # Save original HISTORY_ENABLED to restore after each test
+        TestBufferWriters._original_history_enabled = config.HISTORY_ENABLED
+
+    def teardown_method(self):
+        import config
+        if TestBufferWriters._original_history_enabled is not None:
+            config.HISTORY_ENABLED = TestBufferWriters._original_history_enabled
 
     def test_write_md_primary_key(self):
         import collectors.collector_binance as cb
