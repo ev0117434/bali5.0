@@ -8,26 +8,37 @@ sys.path.insert(0, str(Path(__file__).parent.parent))
 
 
 class TestLauncherConfig:
-    def test_all_expected_processes_defined(self):
+    _original_history_enabled = None
+
+    def setup_method(self):
         import config
-        config.HISTORY_ENABLED = True  # test data branch
-        # Re-import to pick up HISTORY_ENABLED change
+        TestLauncherConfig._original_history_enabled = config.HISTORY_ENABLED
+
+    def teardown_method(self):
+        import config
+        import importlib, launcher
+        config.HISTORY_ENABLED = TestLauncherConfig._original_history_enabled
+        importlib.reload(launcher)
+
+    def test_base_processes_always_defined(self):
         import importlib
         import launcher
         importlib.reload(launcher)
 
-        expected_base = {
-            "collector_binance",
-            "collector_bybit",
-            "collector_okx",
-            "collector_gate",
-            "collector_bitget",
-            "redis_monitor",
-            "stale_monitor",
-            "spread_monitor",
-            "snapshot_monitor",
+        base = {
+            "collector_binance", "collector_bybit", "collector_okx",
+            "collector_gate", "collector_bitget",
+            "redis_monitor", "stale_monitor", "spread_monitor",
         }
-        assert set(launcher.PROCESSES.keys()) == expected_base
+        assert base.issubset(set(launcher.PROCESSES.keys()))
+
+    def test_snapshot_monitor_present_with_history_enabled(self):
+        import config
+        config.HISTORY_ENABLED = True
+        import importlib
+        import launcher
+        importlib.reload(launcher)
+        assert "snapshot_monitor" in launcher.PROCESSES
 
     def test_snapshot_monitor_excluded_without_history(self):
         import config
@@ -35,13 +46,11 @@ class TestLauncherConfig:
         import importlib
         import launcher
         importlib.reload(launcher)
-
         assert "snapshot_monitor" not in launcher.PROCESSES
         assert "spread_monitor" in launcher.PROCESSES
 
     def test_all_scripts_exist(self):
-        import config
-        config.HISTORY_ENABLED = True
+        """All scripts in PROCESSES for current branch must exist on disk."""
         import importlib
         import launcher
         importlib.reload(launcher)
@@ -49,10 +58,6 @@ class TestLauncherConfig:
         for name, script in launcher.PROCESSES.items():
             p = Path(script)
             assert p.exists(), f"Script for {name} not found: {script}"
-
-    def teardown_method(self):
-        import config
-        config.HISTORY_ENABLED = True  # restore
 
 
 class TestSubscribeFiles:

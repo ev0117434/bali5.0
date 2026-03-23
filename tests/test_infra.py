@@ -12,7 +12,7 @@ sys.path.insert(0, str(Path(__file__).parent.parent))
 def test_config_imports():
     from config import REDIS_URL, HISTORY_ENABLED, SPREAD_THRESHOLD
     assert SPREAD_THRESHOLD == 1.00
-    assert HISTORY_ENABLED is True
+    assert isinstance(HISTORY_ENABLED, bool)  # True in data branch, False in trade
     assert REDIS_URL.startswith("redis://")
 
 
