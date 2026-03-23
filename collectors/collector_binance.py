@@ -132,11 +132,15 @@ cmd_counter:  int   = 0
 flush_event         = None  # set in main()
 expire_set:   set   = set()
 last_chunk_id: int  = 0
+ob_hist_last_ts: dict = {}  # hist_key → last write ts_ms (OB 10 Hz gate)
 
 stats: dict = {
     "md_msgs": 0, "ob_msgs": 0, "fr_msgs": 0,
     "flushes": 0, "flush_lat_sum": 0.0, "flush_lat_max": 0.0,
-    "batch_sum": 0, "hist_cmds": 0, "reconnects": 0,
+    "batch_sum": 0,
+    "hist_flushes": 0, "hist_flush_lat_sum": 0.0, "hist_flush_lat_max": 0.0,
+    "hist_cmds": 0, "ob_hist_skipped": 0,
+    "reconnects": 0,
 }
 
 
@@ -146,14 +150,12 @@ def write_md_to_buffer(symbol: str, bid: str, ask: str, ts_ms: int, market: str)
     global cmd_counter
     key = f"md:binance:{market}:{symbol}"
     batch_buffer[key] = {"b": bid, "a": ask, "ts": str(ts_ms)}
+    cmd_counter += 1
 
     if config.HISTORY_ENABLED:
         chunk_id = int(ts_ms / 1000 / config.CHUNK_DURATION)
         hist_key = f"md:hist:binance:{market}:{symbol}:{chunk_id}"
         hist_buffer.append((hist_key, f"{bid},{ask},{ts_ms}"))
-        cmd_counter += 2
-    else:
-        cmd_counter += 1
 
 
 def write_ob_to_buffer(symbol: str, bids: list, asks: list, ts_ms: int, market: str):
@@ -167,17 +169,19 @@ def write_ob_to_buffer(symbol: str, bids: list, asks: list, ts_ms: int, market: 
         fields[f"a{i}"]  = price
         fields[f"a{i}q"] = qty
     batch_buffer[key] = fields
+    cmd_counter += 1
 
     if config.HISTORY_ENABLED:
         chunk_id = int(ts_ms / 1000 / config.CHUNK_DURATION)
         hist_key = f"ob:hist:binance:{market}:{symbol}:{chunk_id}"
-        bid_parts = [f"{p},{q}" for p, q in bids[:10]]
-        ask_parts = [f"{p},{q}" for p, q in asks[:10]]
-        line = ",".join(bid_parts + ask_parts + [str(ts_ms)])
-        hist_buffer.append((hist_key, line))
-        cmd_counter += 2
-    else:
-        cmd_counter += 1
+        last_ts  = ob_hist_last_ts.get(hist_key, 0)
+        if ts_ms - last_ts >= config.OB_HIST_MIN_INTERVAL_MS:
+            ob_hist_last_ts[hist_key] = ts_ms
+            bid_parts = [f"{p},{q}" for p, q in bids[:10]]
+            ask_parts = [f"{p},{q}" for p, q in asks[:10]]
+            hist_buffer.append((hist_key, ",".join(bid_parts + ask_parts + [str(ts_ms)])))
+        else:
+            stats["ob_hist_skipped"] += 1
 
 
 def write_fr_to_buffer(symbol: str, rate: str, fr_ts_ms: str):
@@ -185,14 +189,12 @@ def write_fr_to_buffer(symbol: str, rate: str, fr_ts_ms: str):
     key    = f"fr:binance:futures:{symbol}"
     ts_ms  = int(time.time() * 1000)
     batch_buffer[key] = {"fr": rate, "fr_ts": fr_ts_ms}
+    cmd_counter += 1
 
     if config.HISTORY_ENABLED:
         chunk_id = int(ts_ms / 1000 / config.CHUNK_DURATION)
         hist_key = f"fr:hist:binance:futures:{symbol}:{chunk_id}"
         hist_buffer.append((hist_key, f"{rate},{fr_ts_ms},{ts_ms}"))
-        cmd_counter += 2
-    else:
-        cmd_counter += 1
 
 
 # ── WS tasks ───────────────────────────────────────────────────────────────
@@ -307,10 +309,10 @@ async def task_fr():
     await _ws_recv_loop(url, parse_fr, "fr")
 
 
-# ── Flusher ────────────────────────────────────────────────────────────────
+# ── Flusher (primary: hset only) ───────────────────────────────────────────
 
 async def task_flusher(redis: aioredis.Redis):
-    global cmd_counter, last_chunk_id
+    global cmd_counter
 
     while True:
         try:
@@ -322,40 +324,17 @@ async def task_flusher(redis: aioredis.Redis):
             pass
         flush_event.clear()
 
-        if not batch_buffer and not hist_buffer:
+        if not batch_buffer:
             continue
 
-        # Atomic swap (single-threaded asyncio, no lock needed)
         current_batch = batch_buffer.copy()
-        current_hist  = hist_buffer.copy()
         batch_buffer.clear()
-        hist_buffer.clear()
         cmd_counter = 0
 
-        if not current_batch and not current_hist:
-            continue
-
         t_start = time.monotonic()
-
-        # Check for chunk boundary → reset expire_set
-        new_chunk_id = int(time.time() / config.CHUNK_DURATION)
-        if new_chunk_id != last_chunk_id:
-            expire_set.clear()
-            log.info(f"Chunk changed: {last_chunk_id} → {new_chunk_id}")
-            last_chunk_id = new_chunk_id
-
         pipe = redis.pipeline(transaction=False)
-        expire_cmds = 0
-
         for key, fields in current_batch.items():
             pipe.hset(key, mapping=fields)
-
-        for hist_key, line in current_hist:
-            pipe.lpush(hist_key, line)
-            if hist_key not in expire_set:
-                pipe.expire(hist_key, config.CHUNK_TTL)
-                expire_set.add(hist_key)
-                expire_cmds += 1
 
         try:
             await pipe.execute()
@@ -367,13 +346,57 @@ async def task_flusher(redis: aioredis.Redis):
         stats["flush_lat_sum"] += flush_lat_ms
         stats["flush_lat_max"]  = max(stats["flush_lat_max"], flush_lat_ms)
         stats["batch_sum"]     += len(current_batch)
-        stats["hist_cmds"]     += len(current_hist)
+
+        if flush_lat_ms > 50:
+            log.warning(f"Slow primary flush: {flush_lat_ms:.1f}ms keys={len(current_batch)}")
+
+
+# ── Hist flusher (lpush, independent 300ms timer) ──────────────────────────
+
+async def task_hist_flusher(redis: aioredis.Redis):
+    global last_chunk_id
+
+    while True:
+        await asyncio.sleep(config.HIST_FLUSH_INTERVAL_MS / 1000)
+
+        if not hist_buffer:
+            continue
+
+        current_hist = hist_buffer.copy()
+        hist_buffer.clear()
+
+        new_chunk_id = int(time.time() / config.CHUNK_DURATION)
+        if new_chunk_id != last_chunk_id:
+            expire_set.clear()
+            ob_hist_last_ts.clear()
+            log.info(f"Chunk changed: {last_chunk_id} → {new_chunk_id}")
+            last_chunk_id = new_chunk_id
+
+        t_start = time.monotonic()
+        pipe = redis.pipeline(transaction=False)
+        expire_cmds = 0
+        for hist_key, line in current_hist:
+            pipe.lpush(hist_key, line)
+            if hist_key not in expire_set:
+                pipe.expire(hist_key, config.CHUNK_TTL)
+                expire_set.add(hist_key)
+                expire_cmds += 1
+
+        try:
+            await pipe.execute()
+        except Exception as exc:
+            log.error(f"Redis hist pipeline error: {exc}")
+
+        flush_lat_ms = (time.monotonic() - t_start) * 1000
+        stats["hist_flushes"]       += 1
+        stats["hist_flush_lat_sum"] += flush_lat_ms
+        stats["hist_flush_lat_max"]  = max(stats["hist_flush_lat_max"], flush_lat_ms)
+        stats["hist_cmds"]          += len(current_hist)
 
         if flush_lat_ms > 100:
             log.warning(
-                f"Slow flush: {flush_lat_ms:.1f}ms "
-                f"primary={len(current_batch)} hist={len(current_hist)} "
-                f"expire_new={expire_cmds}"
+                f"Slow hist flush: {flush_lat_ms:.1f}ms "
+                f"cmds={len(current_hist)} expire_new={expire_cmds}"
             )
 
 
@@ -383,23 +406,28 @@ async def task_metrics():
     interval = config.METRICS_LOG_INTERVAL
     while True:
         await asyncio.sleep(interval)
-        n = stats["flushes"] or 1
+        n  = stats["flushes"] or 1
+        nh = stats["hist_flushes"] or 1
         log.info(
             f"METRICS | "
             f"md={stats['md_msgs'] / interval:.0f}msg/s "
             f"ob={stats['ob_msgs'] / interval:.0f}msg/s "
-            f"fr={stats['fr_msgs'] / interval:.0f}msg/s "
-            f"hist_writes={stats['hist_cmds'] / interval:.0f}/s "
+            f"fr={stats['fr_msgs'] / interval:.0f}msg/s | "
             f"flush_lat avg={stats['flush_lat_sum'] / n:.1f}ms "
             f"max={stats['flush_lat_max']:.1f}ms "
-            f"batch_avg={stats['batch_sum'] / n:.0f} "
-            f"expire_set_size={len(expire_set)} "
+            f"batch_avg={stats['batch_sum'] / n:.0f} | "
+            f"hist_writes={stats['hist_cmds'] / interval:.0f}/s "
+            f"hist_flush_lat avg={stats['hist_flush_lat_sum'] / nh:.1f}ms "
+            f"max={stats['hist_flush_lat_max']:.1f}ms "
+            f"ob_skip={stats['ob_hist_skipped'] / interval:.0f}/s | "
+            f"expire_set={len(expire_set)} "
             f"reconnects={stats['reconnects']}"
         )
         stats["md_msgs"] = stats["ob_msgs"] = stats["fr_msgs"] = 0
-        stats["hist_cmds"] = 0
+        stats["hist_cmds"] = stats["ob_hist_skipped"] = 0
         stats["flushes"] = stats["flush_lat_sum"] = stats["flush_lat_max"] = 0
         stats["batch_sum"] = 0
+        stats["hist_flushes"] = stats["hist_flush_lat_sum"] = stats["hist_flush_lat_max"] = 0
 
 
 # ── Entry point ────────────────────────────────────────────────────────────
@@ -439,6 +467,7 @@ async def main():
         asyncio.create_task(task_ob_fut(fut_symbols)),
         asyncio.create_task(task_fr()),
         asyncio.create_task(task_flusher(redis)),
+        asyncio.create_task(task_hist_flusher(redis)),
         asyncio.create_task(task_metrics()),
     ]
 

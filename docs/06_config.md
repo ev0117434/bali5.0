@@ -27,8 +27,10 @@ REDIS_DB          = 0
 REDIS_URL         = f"unix://{REDIS_SOCKET_PATH}?db={REDIS_DB}"
 
 # ── Батчинг коллекторов ────────────────────────────────────────────────────
-BATCH_FLUSH_INTERVAL_MS = 250   # мс: макс время до следующего flush
-BATCH_MAX_COMMANDS      = 100   # кол-во Redis команд для принудительного flush
+BATCH_FLUSH_INTERVAL_MS = 250   # мс: макс время до следующего primary flush
+BATCH_MAX_COMMANDS      = 100   # кол-во primary Redis команд для принудительного flush
+HIST_FLUSH_INTERVAL_MS  = 300   # мс: интервал отдельного hist-flusher (lpush)
+OB_HIST_MIN_INTERVAL_MS = 100   # мс: мин интервал между hist-записями OB (10 Hz)
 
 # ── Параметры WebSocket ────────────────────────────────────────────────────
 WS_PING_INTERVAL   = 20    # сек: ping_interval для websockets
@@ -58,9 +60,8 @@ CHUNK_DURATION       = 1200    # сек: 20 минут на чанк
 CHUNK_TTL            = 6000    # сек: TTL каждого hist-ключа (100 мин)
 MAX_HISTORY_CHUNKS   = 4       # чанков в активном окне (= 80 мин)
 
-# История: без downsampling — пишем каждый тик
+# История: MD и FR пишутся на каждый тик, OB ограничен до 10 Hz (OB_HIST_MIN_INTERVAL_MS)
 # Ресурс не ограничен, история >= 1 час для всех типов данных (MD, OB, FR)
-# OB_HIST_SAMPLE_INTERVAL и MD_HIST_SAMPLE_INTERVAL — удалены
 
 # ── Stale Monitor ─────────────────────────────────────────────────────────
 STALE_THRESHOLD_SECONDS = 360  # сек: ключ считается stale если не обновлялся
@@ -69,7 +70,7 @@ STALE_CHECK_INTERVAL    = 30   # сек: как часто проверять
 # ── Redis Monitor ─────────────────────────────────────────────────────────
 REDIS_CHECK_INTERVAL    = 30   # сек
 REDIS_MEMORY_WARN_MB    = 3000 # MB: предупреждение если выше
-REDIS_OPS_WARN_PER_SEC  = 50000  # ops/sec: предупреждение если выше
+REDIS_OPS_WARN_PER_SEC  = 200000  # ops/sec: предупреждение если выше
 
 # ── Spread Monitor ────────────────────────────────────────────────────────
 SPREAD_POLL_INTERVAL_MS = 300  # мс: интервал сканирования
@@ -122,8 +123,10 @@ METRICS_LOG_INTERVAL = 5   # сек: как часто логировать ме
 
 | Константа | Значение | Почему |
 |-----------|---------|--------|
-| `BATCH_FLUSH_INTERVAL_MS` | 250 | Из спецификации. Даёт ≤250мс задержку данных в Redis |
+| `BATCH_FLUSH_INTERVAL_MS` | 250 | Из спецификации. Даёт ≤250мс задержку primary ключей в Redis |
 | `BATCH_MAX_COMMANDS` | 100 | Из спецификации. Pipeline из 100 cmd ≈ 1-2 RTT |
+| `HIST_FLUSH_INTERVAL_MS` | 300 | Отдельный таймер hist-flusher. Изолирует lpush от hset pipeline |
+| `OB_HIST_MIN_INTERVAL_MS` | 100 | OB hist rate limit 10 Hz. Snapshot monitor не требует более высокой частоты |
 | `STALE_THRESHOLD_SECONDS` | 360 | Из спецификации |
 | `SPREAD_POLL_INTERVAL_MS` | 300 | Из спецификации |
 | `SPREAD_THRESHOLD` | 1.00 | Из спецификации |

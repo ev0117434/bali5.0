@@ -18,8 +18,10 @@ REDIS_DB          = 0
 REDIS_URL         = f"unix://{REDIS_SOCKET_PATH}?db={REDIS_DB}"
 
 # ── Батчинг коллекторов ────────────────────────────────────────────────────
-BATCH_FLUSH_INTERVAL_MS = 250   # мс: макс время до следующего flush
-BATCH_MAX_COMMANDS      = 100   # кол-во Redis команд для принудительного flush
+BATCH_FLUSH_INTERVAL_MS = 250   # мс: макс время до следующего primary flush
+BATCH_MAX_COMMANDS      = 100   # кол-во primary Redis команд для принудительного flush
+HIST_FLUSH_INTERVAL_MS  = 300   # мс: интервал отдельного hist-flusher (lpush)
+OB_HIST_MIN_INTERVAL_MS = 100   # мс: мин интервал между hist-записями OB (10 Hz)
 
 # ── Параметры WebSocket ────────────────────────────────────────────────────
 WS_PING_INTERVAL   = 20    # сек: ping_interval для websockets
@@ -59,7 +61,7 @@ STALE_CHECK_INTERVAL    = 30   # сек: как часто проверять
 # ── Redis Monitor ─────────────────────────────────────────────────────────
 REDIS_CHECK_INTERVAL    = 30   # сек
 REDIS_MEMORY_WARN_MB    = 3000 # MB: предупреждение если выше
-REDIS_OPS_WARN_PER_SEC  = 50000  # ops/sec: предупреждение если выше
+REDIS_OPS_WARN_PER_SEC  = 200000  # ops/sec: предупреждение если выше
 
 # ── Spread Monitor ────────────────────────────────────────────────────────
 SPREAD_POLL_INTERVAL_MS = 300  # мс: интервал сканирования
