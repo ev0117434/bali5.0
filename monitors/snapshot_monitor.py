@@ -37,6 +37,18 @@ if not config.HISTORY_ENABLED:
 
 _CSV_HEADER = config.SNAPSHOT_CSV_HEADER
 
+_COMPONENT = "snapshot_monitor"
+
+def _evt(event: str, **kwargs) -> dict:
+    return {"ts": int(time.time() * 1000), "component": _COMPONENT, "event": event, **kwargs}
+
+def _p99(values: list) -> float:
+    """Compute 99th percentile using statistics.quantiles (Python 3.8+)."""
+    from statistics import quantiles
+    if len(values) < 2:
+        return round(values[0], 1) if values else 0.0
+    return round(quantiles(values, n=100)[98], 1)
+
 
 # ── CSV row building ───────────────────────────────────────────────────────
 
@@ -113,7 +125,7 @@ async def load_history(
     chunk_now = int(signal_ts_ms / 1000 / config.CHUNK_DURATION)
     chunks    = [chunk_now - 3, chunk_now - 2, chunk_now - 1, chunk_now]
 
-    log.debug(f"Reading history chunks: {chunks}")
+    log.debug(_evt("history_chunks_read", chunks=chunks))
 
     pipe = redis_data.pipeline(transaction=False)
     for chunk in chunks:
@@ -291,7 +303,11 @@ async def read_current_row(
 async def run_snapshot(redis_data: aioredis.Redis, signal_str: str):
     parts = signal_str.split(",")
     if len(parts) < 7:
-        log.error(f"Invalid signal string: {signal_str}")
+        log.error(_evt("snapshot_error",
+                       symbol="unknown",
+                       row_number=0,
+                       error_type="ValueError",
+                       error_msg=f"Invalid signal string: {signal_str}"))
         return
 
     spot_exch  = parts[0]
@@ -303,16 +319,26 @@ async def run_snapshot(redis_data: aioredis.Redis, signal_str: str):
     signal_ts  = int(parts[6])
 
     Path(config.SNAPSHOT_DIR).mkdir(parents=True, exist_ok=True)
-    fname = (
+    fname = Path(
         f"{config.SNAPSHOT_DIR}/"
         f"{spot_exch}_{fut_exch}_{symbol}_{signal_ts}.csv"
     )
-    log.info(f"Snapshot started: {fname}")
+    log.info(_evt("snapshot_start",
+                  symbol=symbol,
+                  file=str(fname)))
 
     # Step 1: Load history
-    log.info(f"Loading 1h history for {symbol}...")
+    log.info(_evt("history_load_start",
+                  symbol=symbol,
+                  lookback_ms=config.HISTORY_LOOKBACK_MS,
+                  chunks_to_load=config.MAX_HISTORY_CHUNKS))
+    t_load_start = time.monotonic()
     history_rows = await load_history(redis_data, spot_exch, fut_exch, symbol, signal_ts)
-    log.info(f"History loaded: {len(history_rows)} rows")
+    load_lat_ms = (time.monotonic() - t_load_start) * 1000
+    log.info(_evt("history_loaded",
+                  symbol=symbol,
+                  rows_total=len(history_rows),
+                  load_lat_ms=round(load_lat_ms, 1)))
 
     # Step 2: Write header + history
     async with aiofiles.open(fname, "w") as f:
@@ -324,6 +350,10 @@ async def run_snapshot(redis_data: aioredis.Redis, signal_str: str):
     t_start    = time.monotonic()
     row_count  = len(history_rows)
     last_log   = t_start
+
+    row_lats: list[float] = []
+    row_lat_sum: float = 0.0
+    row_lat_max: float = 0.0
 
     while True:
         elapsed = time.monotonic() - t_start
@@ -341,21 +371,50 @@ async def run_snapshot(redis_data: aioredis.Redis, signal_str: str):
                 await f.write(row + "\n")
             row_count += 1
         except Exception as exc:
-            log.warning(f"Error writing snapshot row: {exc}")
+            log.warning(_evt("snapshot_error",
+                             symbol=symbol,
+                             row_number=row_count,
+                             error_type=type(exc).__name__,
+                             error_msg=str(exc)))
 
-        row_lat = (time.monotonic() - t_row_start) * 1000
+        row_lat_ms = (time.monotonic() - t_row_start) * 1000
+        row_lats.append(row_lat_ms)
+        row_lat_sum += row_lat_ms
+        if row_lat_ms > row_lat_max:
+            row_lat_max = row_lat_ms
+
+        if row_lat_ms > 100.0:
+            log.warning(_evt("snapshot_row_slow",
+                             symbol=symbol,
+                             row_lat_ms=round(row_lat_ms, 1),
+                             threshold_ms=100.0,
+                             row_number=row_count))
 
         if time.monotonic() - last_log >= 60:
-            log.info(
-                f"Snapshot {symbol}: elapsed={elapsed:.0f}s "
-                f"rows={row_count} row_lat={row_lat:.1f}ms"
-            )
+            elapsed_s = time.monotonic() - t_start
+            log.info(_evt("snapshot_progress",
+                          symbol=symbol,
+                          elapsed_s=round(elapsed_s, 0),
+                          rows_written=row_count,
+                          row_lat_avg_ms=round(row_lat_sum / max(row_count, 1), 1),
+                          row_lat_max_ms=round(row_lat_max, 1),
+                          row_lat_last_ms=round(row_lat_ms, 1),
+                          remaining_s=round(config.SNAPSHOT_DURATION - elapsed_s, 0)))
             last_log = time.monotonic()
 
         sleep_s = max(0, config.SNAPSHOT_INTERVAL_MS / 1000 - (time.monotonic() - t_row_start))
         await asyncio.sleep(sleep_s)
 
-    log.info(f"Snapshot done: {fname} | rows={row_count} elapsed={elapsed:.0f}s")
+    elapsed_s = time.monotonic() - t_start
+    log.info(_evt("snapshot_complete",
+                  symbol=symbol,
+                  file=str(fname),
+                  rows=row_count,
+                  elapsed_s=round(elapsed_s, 0),
+                  row_lat_avg_ms=round(row_lat_sum / max(row_count, 1), 1),
+                  row_lat_max_ms=round(row_lat_max, 1),
+                  row_lat_p99_ms=_p99(row_lats),
+                  slow_rows=sum(1 for l in row_lats if l > 100.0)))
 
 
 # ── Stream read loop ───────────────────────────────────────────────────────
@@ -371,24 +430,30 @@ async def subscribe_loop(redis_sub: aioredis.Redis, redis_data: aioredis.Redis):
     last_id_raw = await redis_sub.get(config.STREAM_LAST_ID_KEY)
     if last_id_raw:
         last_id = last_id_raw.decode()
-        log.info(f"Resuming stream from id={last_id}")
+        log.info(_evt("stream_resume", stream=config.STREAM_SIGNALS, last_id=last_id))
     else:
         last_id = "$"
-        log.info("First run: starting from current stream position")
-
-    log.info(f"Reading stream {config.STREAM_SIGNALS} (block=2s)")
+        log.info(_evt("stream_first_run", stream=config.STREAM_SIGNALS))
 
     while True:
         try:
             results = await redis_sub.xread(
                 {config.STREAM_SIGNALS: last_id},
                 count=100,
-                block=2000,   # ждём до 2 сек новых сообщений
+                block=2000,   # wait up to 2s for new messages
             )
         except Exception as exc:
-            log.error(f"XREAD error: {exc}")
+            log.error(_evt("xread_error",
+                           stream=config.STREAM_SIGNALS,
+                           error_type=type(exc).__name__,
+                           error_msg=str(exc)))
             await asyncio.sleep(1)
             continue
+
+        log.debug(_evt("stream_read",
+                       stream=config.STREAM_SIGNALS,
+                       messages=len(results) if results else 0,
+                       block_ms=2000))
 
         if not results:
             continue
@@ -401,7 +466,17 @@ async def subscribe_loop(redis_sub: aioredis.Redis, redis_data: aioredis.Redis):
                 if isinstance(signal_str, bytes):
                     signal_str = signal_str.decode()
 
-                log.info(f"Signal received (id={msg_id_str}): {signal_str}")
+                try:
+                    signal_ts = int(signal_str.split(",")[-1])
+                    stream_lag_ms = int(time.time() * 1000) - signal_ts
+                except (ValueError, IndexError):
+                    signal_ts = 0
+                    stream_lag_ms = -1
+
+                log.info(_evt("signal_received",
+                              stream_id=msg_id_str,
+                              signal_str=signal_str[:100],
+                              stream_lag_ms=stream_lag_ms))
 
                 parts = signal_str.split(",")
                 if len(parts) >= 7:
@@ -410,7 +485,7 @@ async def subscribe_loop(redis_sub: aioredis.Redis, redis_data: aioredis.Redis):
                     snap_key = msg_id_str
 
                 if snap_key in active_snapshots and not active_snapshots[snap_key].done():
-                    log.debug(f"Snapshot {snap_key} already running")
+                    log.debug(_evt("snapshot_already_running", snap_key=snap_key))
                 else:
                     task = asyncio.create_task(run_snapshot(redis_data, signal_str))
                     active_snapshots[snap_key] = task
@@ -433,17 +508,19 @@ async def main():
     redis_sub  = aioredis.Redis.from_url(config.REDIS_URL)
     redis_data = aioredis.Redis.from_url(config.REDIS_URL)
 
-    log.info(
-        f"snapshot_monitor started | "
-        f"duration={config.SNAPSHOT_DURATION}s "
-        f"interval={config.SNAPSHOT_INTERVAL_MS}ms "
-        f"lookback={config.HISTORY_LOOKBACK_MS // 1000 // 60}min"
-    )
+    last_id_raw = await redis_sub.get(config.STREAM_LAST_ID_KEY)
+    last_id = last_id_raw.decode() if last_id_raw else "$"
+
+    log.info(_evt("snapshot_monitor_start",
+                  duration_s=config.SNAPSHOT_DURATION,
+                  interval_ms=config.SNAPSHOT_INTERVAL_MS,
+                  lookback_min=config.HISTORY_LOOKBACK_MS // 60000,
+                  stream_resume_id=last_id))
 
     try:
         await subscribe_loop(redis_sub, redis_data)
     except KeyboardInterrupt:
-        log.info("snapshot_monitor stopped")
+        log.info(_evt("snapshot_monitor_stop", reason="KeyboardInterrupt"))
     finally:
         await redis_sub.aclose()
         await redis_data.aclose()
