@@ -1,22 +1,29 @@
-# BALI 5.0 — Logging Design
+# BALI 5.0 — Logging Design (NDJSON)
 
 ## Принципы
 
 1. **Один файл лога на процесс** — нет смешения между модулями
 2. **Rotating файлы** — max 10MB, 5 ротаций = 50MB на модуль
-3. **Консоль только WARNING+** — файл DEBUG+
-4. **Единый формат** — timestamp.ms + level + module + message
-5. **Структурированные METRICS** — ключевое слово для grep/parsing
-6. **Latency в каждом METRICS** — avg и max за период
+3. **Консоль только WARNING+** — человекочитаемый текст
+4. **Файл: NDJSON** — один JSON объект на строку, machine-readable
+5. **Единый envelope** — каждая строка содержит `ts`, `component`, `event`
+6. **Latency в каждом metrics_interval** — avg, max, p99 за период
 
 ---
 
-## Формат строки
+## Формат файла
+
+Каждый лог-файл — **NDJSON** (Newline-Delimited JSON). Одна строка = один JSON объект:
 
 ```
-[2024-01-15 10:23:45.123] [INFO ] [collector_binance] <message>
-[2024-01-15 10:23:45.456] [WARN ] [spread_monitor] <message>
-[2024-01-15 10:23:45.789] [ERROR] [redis_monitor] <message>
+{"ts":1741234567890,"component":"collector_binance","event":"collector_start","exchange":"binance","spot_symbols":1200,"fut_symbols":380}
+{"ts":1741234567891,"component":"collector_binance","event":"ws_connect","exchange":"binance","stream":"md_spot","url_prefix":"wss://stream.binance.com","symbols":1200}
+{"ts":1741234572890,"component":"collector_binance","event":"metrics_interval","exchange":"binance","interval_s":5.0,...}
+```
+
+Консоль (WARNING+ только) — по-прежнему человекочитаемый текст:
+```
+[2024-01-15 10:23:45.456] [WARNING ] [spread_monitor] {...}
 ```
 
 ---
@@ -39,151 +46,238 @@ logs/
 
 ---
 
-## Общая функция setup_logger
+## Универсальный envelope
 
-```python
-# logger_setup.py
-import logging
-from logging.handlers import RotatingFileHandler
-from pathlib import Path
+Каждое событие содержит минимум три поля:
 
-def setup_logger(name: str, level_file=logging.DEBUG, level_console=logging.WARNING) -> logging.Logger:
-    Path("logs").mkdir(exist_ok=True)
-
-    logger = logging.getLogger(name)
-    logger.setLevel(logging.DEBUG)
-    logger.propagate = False
-
-    fmt = logging.Formatter(
-        "[%(asctime)s.%(msecs)03d] [%(levelname)-5s] [%(name)s] %(message)s",
-        datefmt="%Y-%m-%d %H:%M:%S"
-    )
-
-    # Rotating file handler
-    fh = RotatingFileHandler(
-        f"logs/{name}.log",
-        maxBytes=10_000_000,   # 10 MB
-        backupCount=5,
-        encoding="utf-8"
-    )
-    fh.setLevel(level_file)
-    fh.setFormatter(fmt)
-
-    # Console handler
-    ch = logging.StreamHandler()
-    ch.setLevel(level_console)
-    ch.setFormatter(fmt)
-
-    logger.addHandler(fh)
-    logger.addHandler(ch)
-    return logger
-```
+| Поле | Тип | Описание |
+|------|-----|----------|
+| `ts` | `int` | Unix timestamp, миллисекунды |
+| `component` | `str` | Имя процесса (`collector_binance`, `spread_monitor`, ...) |
+| `event` | `str` | Тип события (см. каталог ниже) |
 
 ---
 
-## Что логировать: таблица
+## Каталог событий
 
 ### collector_{exchange}.log
 
-| Событие | Level | Периодичность | Пример сообщения |
-|---------|-------|--------------|-----------------|
-| Старт | INFO | 1 раз | `Starting collector_binance \| spot=412 fut=389 symbols` |
-| WS connect | INFO | при подключении | `[md_spot] Connected to wss://stream.binance... symbols=412` |
-| WS disconnect | WARNING | при разрыве | `[md_spot] WS disconnected: code=1006 reason='' reconnecting in 2s` |
-| WS reconnect OK | INFO | при восстановлении | `[md_spot] Reconnected after 2s (attempt=1)` |
-| WS reconnect fail | ERROR | при ошибке | `[md_spot] Reconnect attempt 5 failed: Connection refused` |
-| Metrics | INFO | каждые 5 сек | `METRICS \| md=1523msg/s ob=412msg/s fr=5msg/s flush_lat avg=2.1ms max=8.3ms batch_avg=87 reconnects=0` |
-| Flush медленный | WARNING | при flush > 100ms | `Slow flush: 145.3ms (threshold=100ms) batch=97` |
-| Смена чанка | INFO | каждые 20 мин | `Chunk changed: 1421093 → 1421094 \| expire old=1421090` |
-| Пустой subscribe | WARNING | при старте | `[ob_spot] Empty symbol list, skipping task` |
+| Event | Level | Когда |
+|-------|-------|-------|
+| `collector_start` | INFO | Старт процесса |
+| `symbols_loaded` | INFO | Загрузка символов |
+| `symbol_file_missing` | ERROR | Файл символов не найден |
+| `no_symbols` | ERROR | Пустой список символов |
+| `ws_connect` | INFO | Попытка подключения к WS |
+| `ws_connected` | INFO | WS подключён |
+| `ws_disconnect` | WARNING | WS разрыв / ошибка → reconnect |
+| `heartbeat_error` | DEBUG | Ошибка heartbeat (bybit/okx/bitget) |
+| `redis_error` | ERROR | Ошибка Redis pipeline |
+| `slow_flush` | WARNING | Primary flush > 50ms или hist flush > 100ms |
+| `chunk_rotate` | INFO | Смена history chunk ID |
+| `parse_error` | — | Через `parse_errors` счётчик в `metrics_interval` |
+| `metrics_interval` | INFO | Каждые 5s — агрегат метрик |
+| `collector_stop` | INFO | Остановка процесса |
+
+**metrics_interval** содержит вложенные объекты:
+
+```json
+{
+  "ts": 1741234572890,
+  "component": "collector_binance",
+  "event": "metrics_interval",
+  "exchange": "binance",
+  "interval_s": 5.0,
+  "ingestion": {
+    "md_msgs": 6024, "md_msgs_per_s": 1204.8,
+    "ob_msgs": 3987, "ob_msgs_per_s": 797.4,
+    "fr_msgs": 1012, "fr_msgs_per_s": 202.4,
+    "parse_errors": 0, "parse_errors_per_s": 0.0
+  },
+  "primary_flush": {
+    "count": 20, "count_per_s": 4.0,
+    "batch_avg": 85.3, "lat_avg_ms": 12.5, "lat_max_ms": 45.2, "slow_count": 0
+  },
+  "history_flush": {
+    "count": 17, "cmds_total": 142000, "cmds_per_s": 28400.0,
+    "lat_avg_ms": 22.3, "lat_max_ms": 98.1, "slow_count": 1,
+    "ob_skipped": 251, "ob_skipped_per_s": 50.2
+  },
+  "latency": {
+    "parse_avg_us": 145.0, "parse_max_us": 890.0,
+    "buffer_age_avg_ms": 87.3, "buffer_age_max_ms": 248.1
+  },
+  "state": {
+    "expire_keys_tracked": 4200, "reconnects": 0, "active_streams": 5
+  }
+}
+```
+
+> **Примечание:** `latency.e2e_avg_ms` / `e2e_max_ms` присутствуют у bybit/okx/gate/bitget (есть exchange timestamp). У Binance — отсутствуют (bookTicker не содержит ts).
+
+---
 
 ### spread_monitor.log
 
-| Событие | Level | Периодичность | Пример |
-|---------|-------|--------------|--------|
-| Старт | INFO | 1 раз | `Starting spread_monitor \| pairs=3842 files=20` |
-| Цикл debug | DEBUG | каждые 300мс | `Cycle: 23.4ms \| pairs=3842 no_data=12 stale=3 signals=0` |
-| Медленный цикл | WARNING | при > 250ms | `Slow cycle: 287.1ms > 250ms threshold` |
-| Сигнал | INFO | при сигнале | `SIGNAL \| binance→bybit BTCUSDT ask=45000.10 bid=45676.35 spread=1.5023%` |
-| Cooldown hit | DEBUG | при cooldown | `Cooldown active: binance→bybit BTCUSDT (TTL=3243s)` |
+| Event | Level | Когда |
+|-------|-------|-------|
+| `spread_monitor_start` | INFO | Старт |
+| `signal` | INFO | Спред ≥ threshold |
+| `cycle` | DEBUG | Каждые 300ms |
+| `cycle_slow` | WARNING | Цикл > 250ms |
+| `spread_summary` | INFO | Каждые 30s — агрегат |
+| `no_pairs` | WARNING | Нет combination files |
+| `redis_error` | ERROR | Ошибка Redis |
+| `spread_monitor_stop` | INFO | Остановка |
 
-### snapshot_monitor.log
+```json
+{
+  "ts": 1741234567890, "component": "spread_monitor", "event": "signal",
+  "spot_exchange": "binance", "fut_exchange": "bybit", "symbol": "BTCUSDT",
+  "ask_spot": 45000.10, "bid_fut": 45676.35, "spread_pct": 1.5023,
+  "data_age_spot_ms": 120, "data_age_fut_ms": 85,
+  "cooldown_applied": false, "emit_lat_ms": 1.2
+}
+```
 
-| Событие | Level | Периодичность | Пример |
-|---------|-------|--------------|--------|
-| Сигнал получен | INFO | при сигнале | `Signal received: binance,bybit,BTCUSDT,...` |
-| История загружена | INFO | при старте snap | `History loaded: 10847 rows for BTCUSDT (60min window)` |
-| Snapshot старт | INFO | при старте snap | `Snapshot started: signal/snapshot/binance_bybit_BTCUSDT_1705312345890.csv` |
-| Прогресс | INFO | каждые 60 сек | `Snapshot BTCUSDT: elapsed=300s rows=1247 row_lat=4.2ms` |
-| Snapshot конец | INFO | по окончании | `Snapshot done: rows=11667 elapsed=3500s file=...csv` |
-| Нет истории | WARNING | при пустой | `No history for ob:hist:binance:spot:BTCUSDT (chunk=1421090) — new symbol?` |
-
-### stale_monitor.log
-
-| Событие | Level | Периодичность | Пример |
-|---------|-------|--------------|--------|
-| Цикл OK | INFO | каждые 30 сек | `Stale check: total_keys=4123 stale=0 elapsed=234ms` |
-| Stale ключ | WARNING | при stale | `STALE \| md:gate:spot:XYZUSDT age=412s last_ts=1705312000000` |
-| Много stale | ERROR | при > 10 stale | `HIGH STALE COUNT: 45 keys stale (>10 threshold)` |
+---
 
 ### redis_monitor.log
 
-| Событие | Level | Периодичность | Пример |
-|---------|-------|--------------|--------|
-| Health OK | INFO | каждые 30 сек | `REDIS OK \| mem=1234.5MB peak=1240.0MB ops/s=8432 clients=12 keys=49832 hit_rate=99.8% ping=0.8ms` |
-| Redis недоступен | ERROR | при ошибке | `Redis UNREACHABLE: Connection refused` |
-| Память высокая | WARNING | при > 3GB | `Redis memory high: 3127.4MB (threshold=3000MB)` |
+| Event | Level | Когда |
+|-------|-------|-------|
+| `redis_monitor_start` | INFO | Старт |
+| `redis_health` | INFO | Каждые 30s |
+| `redis_warn` | WARNING | Одно событие на каждый threshold violation |
+| `redis_unreachable` | ERROR | Redis недоступен |
+| `redis_monitor_stop` | INFO | Остановка |
+
+`redis_warn.warning` values: `memory_high`, `ops_high`, `fragmentation_high`, `blocked_clients`
+
+---
+
+### stale_monitor.log
+
+| Event | Level | Когда |
+|-------|-------|-------|
+| `stale_monitor_start` | INFO | Старт |
+| `stale_scan` | INFO | Каждые 30s — итог сканирования |
+| `stale_key` | WARNING | Одно событие на каждый stale ключ |
+| `key_skip` | DEBUG | Ключ пропущен (not_a_hash / no_ts_field / ts_parse_error) |
+| `stale_monitor_stop` | INFO | Остановка |
+
+---
+
+### snapshot_monitor.log
+
+| Event | Level | Когда |
+|-------|-------|-------|
+| `snapshot_monitor_start` | INFO | Старт |
+| `stream_first_run` / `stream_resume` | INFO | Позиция в стриме |
+| `stream_read` | DEBUG | Каждый XREAD poll |
+| `signal_received` | INFO | Получен сигнал из stream:signals |
+| `snapshot_start` | INFO | Открыт файл snapshot |
+| `history_load_start` | INFO | Начало загрузки истории |
+| `history_loaded` | INFO | История загружена |
+| `snapshot_progress` | INFO | Каждые 60s во время записи |
+| `snapshot_row_slow` | WARNING | Строка записана > 100ms |
+| `snapshot_complete` | INFO | Snapshot завершён |
+| `snapshot_error` | WARNING | Ошибка при записи строки |
+| `xread_error` | ERROR | Ошибка XREAD |
+| `snapshot_monitor_stop` | INFO | Остановка |
+
+---
 
 ### launcher.log
 
-| Событие | Level | Периодичность | Пример |
-|---------|-------|--------------|--------|
-| Старт | INFO | 1 раз | `BALI 5.0 launcher starting` |
-| Процесс запущен | INFO | при старте | `Started collector_binance PID=12345` |
-| Процесс умер | ERROR | при смерти | `Process collector_binance (PID=12345) died! Restarting...` |
-| Health check OK | DEBUG | каждые 30 сек | `Health check: all 9 processes alive` |
-| Shutdown | INFO | при SIGTERM | `Shutting down: terminating 9 processes` |
+| Event | Level | Когда |
+|-------|-------|-------|
+| `launcher_start` | INFO | Старт системы |
+| `redis_ready` | INFO | Redis доступен |
+| `redis_unavailable` | WARNING | Redis ещё не готов (retry) |
+| `redis_not_ready` | ERROR | Redis не доступен после 10 попыток |
+| `redis_flushed` | INFO | Redis очищен при старте |
+| `subscribe_file_missing` | WARNING | Файл символов отсутствует |
+| `subscribe_file_ok` | INFO | Файл символов валиден |
+| `process_started` | INFO | Процесс запущен |
+| `process_died` | ERROR | Процесс упал |
+| `process_restarted` | INFO | Процесс перезапущен |
+| `terminate_failed` | WARNING | Не удалось завершить процесс |
+| `warmup_wait` | INFO | Ожидание прогрева коллекторов |
+| `all_started` | INFO | Все процессы запущены |
+| `shutdown` | INFO | SIGTERM получен |
 
 ---
 
-## Пример лог-файла spread_monitor.log (первые минуты)
-
-```
-[2024-01-15 10:00:00.001] [INFO ] [spread_monitor] Starting spread_monitor | pairs=3842 files=20
-[2024-01-15 10:00:00.045] [INFO ] [spread_monitor] Loaded combinations: binance_spot_bybit_futures=412 pairs, ...
-[2024-01-15 10:00:00.046] [INFO ] [spread_monitor] signal/signal.csv: header written
-[2024-01-15 10:00:00.047] [INFO ] [spread_monitor] Monitor loop started (threshold=1.00% cooldown=3600s)
-[2024-01-15 10:00:00.300] [DEBUG] [spread_monitor] Cycle: 254.2ms | pairs=3842 no_data=3842 stale=0 signals=0
-[2024-01-15 10:00:00.601] [DEBUG] [spread_monitor] Cycle: 23.1ms | pairs=3842 no_data=412 stale=0 signals=0
-...
-[2024-01-15 10:00:15.302] [DEBUG] [spread_monitor] Cycle: 21.8ms | pairs=3842 no_data=0 stale=3 signals=0
-[2024-01-15 10:05:23.156] [INFO ] [spread_monitor] SIGNAL | binance→bybit BTCUSDT ask=45000.10 bid=45676.35 spread=1.5023%
-[2024-01-15 10:05:23.203] [DEBUG] [spread_monitor] Cooldown set: binance→bybit BTCUSDT (3600s)
-```
-
----
-
-## Grep-команды для диагностики
+## jq-команды для диагностики
 
 ```bash
-# Все сигналы за последний час
-grep "SIGNAL" logs/spread_monitor.log | tail -50
+# Все сигналы
+jq 'select(.event == "signal")' logs/spread_monitor.log
 
-# Метрики коллектора (задержки flush)
-grep "METRICS" logs/collector_binance.log | tail -20
+# Метрики коллектора — msg/s за последние записи
+jq 'select(.event == "metrics_interval") | {ts, md: .ingestion.md_msgs_per_s, ob: .ingestion.ob_msgs_per_s, flush_lat: .primary_flush.lat_avg_ms}' logs/collector_binance.log | tail -5
 
 # Медленные циклы spread monitor
-grep "Slow cycle" logs/spread_monitor.log
+jq 'select(.event == "cycle_slow")' logs/spread_monitor.log
 
-# Все реконнекты
-grep "Reconnect" logs/collector_*.log
+# Все WS реконнекты
+jq 'select(.event == "ws_disconnect")' logs/collector_*.log
 
 # Stale ключи
-grep "STALE" logs/stale_monitor.log | tail -20
+jq 'select(.event == "stale_key")' logs/stale_monitor.log
 
-# Redis проблемы
-grep -E "UNREACHABLE|high" logs/redis_monitor.log
+# Redis warnings
+jq 'select(.event == "redis_warn")' logs/redis_monitor.log
 
-# Ошибки по всем логам
-grep "ERROR" logs/*.log | tail -50
+# Redis health последняя запись
+jq 'select(.event == "redis_health")' logs/redis_monitor.log | tail -1 | jq .
+
+# Ошибки Redis pipeline
+jq 'select(.event == "redis_error")' logs/collector_*.log
+
+# Parse errors по коллекторам
+jq 'select(.event == "metrics_interval" and .ingestion.parse_errors > 0)' logs/collector_*.log
+
+# Медленные snapshot строки
+jq 'select(.event == "snapshot_row_slow")' logs/snapshot_monitor.log
+
+# Процессы которые падали
+jq 'select(.event == "process_died")' logs/launcher.log
+
+# E2E latency (bybit пример)
+jq 'select(.event == "metrics_interval") | .latency.e2e_avg_ms' logs/collector_bybit.log | tail -5
+
+# Все ошибки по всем логам
+jq 'select(.level == "ERROR")' logs/*.log 2>/dev/null | jq '{ts, component, event, error_msg}'
+
+# Сигналы за последний час (ts > now-3600000)
+NOW=$(python3 -c "import time; print(int(time.time()*1000))"); \
+jq --argjson since "$((NOW - 3600000))" 'select(.event == "signal" and .ts > $since)' logs/spread_monitor.log
 ```
+
+---
+
+## Реализация: JsonFormatter
+
+`logger_setup.py` содержит `JsonFormatter` — форматтер для file handler:
+
+- **Dict message** → shallow copy → JSON (всегда содержит `ts` и `level` через `setdefault`)
+- **String message** → envelope с `ts`, `component`, `event="log"`, `level`, `msg`
+- **exc_info** → добавляет поле `"traceback"` с трейсбеком
+
+Каждый скрипт определяет локальную фабрику:
+
+```python
+_COMPONENT = "collector_binance"
+
+def _evt(event: str, **kwargs) -> dict:
+    return {"ts": int(time.time() * 1000), "component": _COMPONENT, "event": event, **kwargs}
+```
+
+---
+
+## Связанные документы
+
+- `docs/superpowers/specs/2026-03-23-json-metrics-schema-design.md` — полная схема всех событий
+- `docs/superpowers/plans/2026-03-23-json-metrics-implementation.md` — план реализации
