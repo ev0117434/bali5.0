@@ -152,19 +152,12 @@ python monitors/stale_monitor.py
 ## 6. Переменные окружения (override config)
 
 ```bash
-# Переопределить Redis host
-REDIS_HOST=192.168.1.100 python launcher.py
-
 # Включить DEBUG на консоли (для разработки)
 LOG_CONSOLE_LEVEL=DEBUG python collectors/collector_binance.py
 ```
 
-В config.py:
-```python
-import os
-REDIS_HOST = os.getenv("REDIS_HOST", "localhost")
-REDIS_PORT = int(os.getenv("REDIS_PORT", "6379"))
-```
+Примечание: Redis работает только через Unix socket (`/root/bali5.0/redis.sock`).
+TCP-переопределение через `REDIS_HOST`/`REDIS_PORT` не поддерживается — используйте `redis.conf`.
 
 ---
 
