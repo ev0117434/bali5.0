@@ -4,7 +4,7 @@ import sys, time
 from pathlib import Path
 sys.path.insert(0, str(Path(__file__).parent.parent))
 
-from dashboard.state import DashboardState, resolve_stream_status
+from dashboard.state import DashboardState, StreamState, resolve_stream_status
 from dashboard.parser import StateParser
 
 
@@ -226,7 +226,3 @@ class TestStreamStatusResolution:
         stream.last_reconnect_ts = 0.0
         stale_ts = time.monotonic() - 120   # 120s ago
         assert resolve_stream_status(stream, stale_ts) == "dead"
-
-
-# Import StreamState for TestStreamStatusResolution
-from dashboard.state import StreamState
