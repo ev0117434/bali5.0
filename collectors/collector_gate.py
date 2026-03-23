@@ -39,15 +39,24 @@ log = setup_logger("collector_gate")
 _WS_SPOT    = "wss://api.gateio.ws/ws/v4/"
 _WS_FUTURES = "wss://fx-ws.gateio.ws/v4/ws/usdt"
 
+_COMPONENT = "collector_gate"
+
+
+def _evt(event: str, **kwargs) -> dict:
+    """Build a metrics event envelope with ts/component/event."""
+    return {"ts": int(time.time() * 1000), "component": _COMPONENT, "event": event, **kwargs}
+
 
 # ── Symbol maps ─────────────────────────────────────────────────────────────
 
 def _load_symbols(filepath: str) -> list[str]:
     p = Path(filepath)
     if not p.exists():
-        log.error(f"Symbol file not found: {filepath}")
+        log.error(_evt("symbol_file_missing", exchange="gate", path=str(p)))
         return []
-    return [l.strip() for l in p.read_text().splitlines() if l.strip()]
+    lines = [l.strip() for l in p.read_text().splitlines() if l.strip()]
+    log.info(_evt("symbols_loaded", exchange="gate", count=len(lines), path=str(p)))
+    return lines
 
 
 def _load_native_map(norm_file: str, native_file: str) -> dict[str, str]:
@@ -66,6 +75,7 @@ def _normalize(native: str) -> str:
 
 def parse_md_spot(raw: str):
     """Parse Gate.io spot.book_ticker → (symbol, bid, ask, ts_ms) or None."""
+    _t = time.monotonic()
     try:
         msg = json.loads(raw)
         if msg.get("event") in ("subscribe", "unsubscribe"):
@@ -82,13 +92,27 @@ def parse_md_spot(raw: str):
         if not bid or not ask:
             return None
         ts_ms = int(result.get("t", int(time.time() * 1000)))
+        # e2e latency
+        e2e_ms = time.time() * 1000 - ts_ms
+        if e2e_ms >= 0:
+            stats["e2e_lat_sum"] += e2e_ms
+            stats["e2e_lat_count"] += 1
+            if e2e_ms > stats["e2e_lat_max"]:
+                stats["e2e_lat_max"] = e2e_ms
         return symbol, bid, ask, ts_ms
     except Exception:
+        stats["parse_errors"] += 1
         return None
+    finally:
+        elapsed_us = (time.monotonic() - _t) * 1_000_000
+        stats["parse_lat_sum"] += elapsed_us
+        if elapsed_us > stats["parse_lat_max"]:
+            stats["parse_lat_max"] = elapsed_us
 
 
 def parse_md_fut(raw: str):
     """Parse Gate.io futures.book_ticker → (symbol, bid, ask, ts_ms) or None."""
+    _t = time.monotonic()
     try:
         msg = json.loads(raw)
         if msg.get("event") in ("subscribe", "unsubscribe"):
@@ -105,13 +129,27 @@ def parse_md_fut(raw: str):
         if not symbol or not bid or not ask:
             return None
         ts_ms = int(result.get("t", int(time.time() * 1000)))
+        # e2e latency
+        e2e_ms = time.time() * 1000 - ts_ms
+        if e2e_ms >= 0:
+            stats["e2e_lat_sum"] += e2e_ms
+            stats["e2e_lat_count"] += 1
+            if e2e_ms > stats["e2e_lat_max"]:
+                stats["e2e_lat_max"] = e2e_ms
         return symbol, bid, ask, ts_ms
     except Exception:
+        stats["parse_errors"] += 1
         return None
+    finally:
+        elapsed_us = (time.monotonic() - _t) * 1_000_000
+        stats["parse_lat_sum"] += elapsed_us
+        if elapsed_us > stats["parse_lat_max"]:
+            stats["parse_lat_max"] = elapsed_us
 
 
 def parse_ob_spot(raw: str):
     """Parse Gate.io spot.order_book → (symbol, bids, asks, ts_ms) or None."""
+    _t = time.monotonic()
     try:
         msg = json.loads(raw)
         if msg.get("event") in ("subscribe", "unsubscribe"):
@@ -128,36 +166,67 @@ def parse_ob_spot(raw: str):
         if not symbol:
             return None
         ts_ms = int(result.get("t", int(time.time() * 1000)))
+        # e2e latency
+        e2e_ms = time.time() * 1000 - ts_ms
+        if e2e_ms >= 0:
+            stats["e2e_lat_sum"] += e2e_ms
+            stats["e2e_lat_count"] += 1
+            if e2e_ms > stats["e2e_lat_max"]:
+                stats["e2e_lat_max"] = e2e_ms
         return symbol, bids, asks, ts_ms
     except Exception:
+        stats["parse_errors"] += 1
         return None
+    finally:
+        elapsed_us = (time.monotonic() - _t) * 1_000_000
+        stats["parse_lat_sum"] += elapsed_us
+        if elapsed_us > stats["parse_lat_max"]:
+            stats["parse_lat_max"] = elapsed_us
 
 
 def parse_ob_fut(raw: str):
-    """Parse Gate.io futures.order_book_update → (symbol, bids, asks, ts_ms) or None."""
+    """Parse Gate.io futures.order_book snapshot → (symbol, bids, asks, ts_ms) or None.
+    Uses futures.order_book (full snapshots, event="all") instead of
+    futures.order_book_update (incremental diffs) to always have a complete book.
+    """
+    _t = time.monotonic()
     try:
         msg = json.loads(raw)
-        if msg.get("event") in ("subscribe", "unsubscribe"):
+        if msg.get("event") in ("subscribe", "unsubscribe", "update"):
             return None
         result = msg.get("result")
         if not result:
             return None
         channel = msg.get("channel", "")
-        if channel != "futures.order_book_update":
+        if channel != "futures.order_book":
             return None
-        symbol = _normalize(result.get("s", ""))
-        bids   = [[b["p"], b["s"]] for b in result.get("b", [])[:10]]
-        asks   = [[a["p"], a["s"]] for a in result.get("a", [])[:10]]
+        symbol = _normalize(result.get("contract", "") or result.get("s", ""))
+        bids   = [[b["p"], b["s"]] for b in result.get("bids", [])[:10]]
+        asks   = [[a["p"], a["s"]] for a in result.get("asks", [])[:10]]
         if not symbol:
             return None
         ts_ms = int(result.get("t", int(time.time() * 1000)))
+        # e2e latency
+        e2e_ms = time.time() * 1000 - ts_ms
+        if e2e_ms >= 0:
+            stats["e2e_lat_sum"] += e2e_ms
+            stats["e2e_lat_count"] += 1
+            if e2e_ms > stats["e2e_lat_max"]:
+                stats["e2e_lat_max"] = e2e_ms
         return symbol, bids, asks, ts_ms
     except Exception:
+        stats["parse_errors"] += 1
         return None
+    finally:
+        elapsed_us = (time.monotonic() - _t) * 1_000_000
+        stats["parse_lat_sum"] += elapsed_us
+        if elapsed_us > stats["parse_lat_max"]:
+            stats["parse_lat_max"] = elapsed_us
 
 
 def parse_fr(raw: str):
     """Parse Gate.io futures.tickers → (symbol, rate, fr_ts_str) or None."""
+    _t = time.monotonic()
     try:
         msg = json.loads(raw)
         if msg.get("event") in ("subscribe", "unsubscribe"):
@@ -168,14 +237,21 @@ def parse_fr(raw: str):
         r = result[0] if isinstance(result, list) else result
         symbol = _normalize(r.get("contract", ""))
         rate   = r.get("funding_rate", "")
-        # funding_next_apply is in SECONDS — convert to ms
-        fr_ts_sec = r.get("funding_next_apply", 0)
         if not rate or not symbol:
             return None
-        fr_ts_ms = str(int(fr_ts_sec) * 1000)
+        # Gate USDT-perp funds every 8h at 00:00/08:00/16:00 UTC.
+        # Always compute next boundary — funding_next_apply is unreliable (often 0).
+        now = int(time.time())
+        fr_ts_ms = str(((now // 28800) + 1) * 28800 * 1000)
         return symbol, str(rate), fr_ts_ms
     except Exception:
+        stats["parse_errors"] += 1
         return None
+    finally:
+        elapsed_us = (time.monotonic() - _t) * 1_000_000
+        stats["parse_lat_sum"] += elapsed_us
+        if elapsed_us > stats["parse_lat_max"]:
+            stats["parse_lat_max"] = elapsed_us
 
 
 # ── Shared state ───────────────────────────────────────────────────────────
@@ -187,6 +263,7 @@ flush_event         = None
 expire_set:   set  = set()
 last_chunk_id: int = 0
 ob_hist_last_ts: dict = {}  # hist_key → last write ts_ms (OB 10 Hz gate)
+buffer_write_ts: dict[str, float] = {}  # key → time.monotonic() when first written
 
 stats: dict = {
     "md_msgs": 0, "ob_msgs": 0, "fr_msgs": 0,
@@ -195,6 +272,17 @@ stats: dict = {
     "hist_flushes": 0, "hist_flush_lat_sum": 0.0, "hist_flush_lat_max": 0.0,
     "hist_cmds": 0, "ob_hist_skipped": 0,
     "reconnects": 0,
+    # ── new fields ────────────────────────────────────────────────────────
+    "parse_errors":          0,
+    "parse_lat_sum":         0.0,   # microseconds
+    "parse_lat_max":         0.0,
+    "flush_slow_count":      0,
+    "hist_flush_slow_count": 0,
+    "buffer_age_sum":        0.0,   # ms; accumulated at each flush
+    "buffer_age_max":        0.0,
+    "e2e_lat_sum":           0.0,   # ms
+    "e2e_lat_max":           0.0,
+    "e2e_lat_count":         0,
 }
 
 
@@ -202,6 +290,8 @@ def write_md_to_buffer(symbol: str, bid: str, ask: str, ts_ms: int, market: str)
     global cmd_counter
     key = f"md:gate:{market}:{symbol}"
     batch_buffer[key] = {"b": bid, "a": ask, "ts": str(ts_ms)}
+    if key not in buffer_write_ts:
+        buffer_write_ts[key] = time.monotonic()
     cmd_counter += 1
 
     if config.HISTORY_ENABLED:
@@ -221,6 +311,8 @@ def write_ob_to_buffer(symbol: str, bids: list, asks: list, ts_ms: int, market: 
         fields[f"a{i}"]  = str(price)
         fields[f"a{i}q"] = str(qty)
     batch_buffer[key] = fields
+    if key not in buffer_write_ts:
+        buffer_write_ts[key] = time.monotonic()
     cmd_counter += 1
 
     if config.HISTORY_ENABLED:
@@ -240,7 +332,10 @@ def write_fr_to_buffer(symbol: str, rate: str, fr_ts_ms: str):
     global cmd_counter
     key   = f"fr:gate:futures:{symbol}"
     ts_ms = int(time.time() * 1000)
+    # Always write fr_ts (even ""); Gate messages are full snapshots, no delta pattern.
     batch_buffer[key] = {"fr": rate, "fr_ts": fr_ts_ms}
+    if key not in buffer_write_ts:
+        buffer_write_ts[key] = time.monotonic()
     cmd_counter += 1
 
     if config.HISTORY_ENABLED:
@@ -262,7 +357,7 @@ async def _ws_task(url: str, label: str, subscribe_fn, parse_fn, write_fn,
 
     while True:
         try:
-            log.info(f"[{label}] Connecting: {url}")
+            log.info(_evt("ws_connect", exchange="gate", stream=label, url=url))
             async with websockets.connect(
                 url,
                 ping_interval=config.WS_PING_INTERVAL,
@@ -270,7 +365,7 @@ async def _ws_task(url: str, label: str, subscribe_fn, parse_fn, write_fn,
                 close_timeout=config.WS_CLOSE_TIMEOUT,
                 max_size=config.WS_MAX_SIZE,
             ) as ws:
-                log.info(f"[{label}] Connected")
+                log.info(_evt("ws_connected", exchange="gate", stream=label))
                 backoff = config.WS_RECONNECT_INIT
 
                 await subscribe_fn(ws)
@@ -287,8 +382,10 @@ async def _ws_task(url: str, label: str, subscribe_fn, parse_fn, write_fn,
             raise
         except Exception as exc:
             stats["reconnects"] += 1
-            log.warning(f"[{label}] WS error: {type(exc).__name__}: {exc}. "
-                        f"Reconnecting in {backoff}s...")
+            log.warning(_evt("ws_disconnect", exchange="gate", stream=label,
+                             error_type=type(exc).__name__, error_msg=str(exc),
+                             reconnect_backoff_s=backoff,
+                             reconnects_total=stats["reconnects"]))
             await asyncio.sleep(backoff)
             backoff = min(backoff * 2, config.WS_RECONNECT_MAX)
 
@@ -339,6 +436,7 @@ async def task_ob_spot(native_spot: list[str]):
 
     while True:
         try:
+            log.info(_evt("ws_connect", exchange="gate", stream="ob_spot", url=_WS_SPOT))
             async with websockets.connect(
                 _WS_SPOT,
                 ping_interval=config.WS_PING_INTERVAL,
@@ -346,7 +444,8 @@ async def task_ob_spot(native_spot: list[str]):
                 close_timeout=config.WS_CLOSE_TIMEOUT,
                 max_size=config.WS_MAX_SIZE,
             ) as ws:
-                log.info(f"[ob_spot] Connected. symbols={len(native_spot)}")
+                log.info(_evt("ws_connected", exchange="gate", stream="ob_spot",
+                              symbols=len(native_spot)))
                 backoff = config.WS_RECONNECT_INIT
 
                 # Subscribe each symbol individually
@@ -372,8 +471,10 @@ async def task_ob_spot(native_spot: list[str]):
             raise
         except Exception as exc:
             stats["reconnects"] += 1
-            log.warning(f"[ob_spot] WS error: {type(exc).__name__}: {exc}. "
-                        f"Reconnecting in {backoff}s...")
+            log.warning(_evt("ws_disconnect", exchange="gate", stream="ob_spot",
+                             error_type=type(exc).__name__, error_msg=str(exc),
+                             reconnect_backoff_s=backoff,
+                             reconnects_total=stats["reconnects"]))
             await asyncio.sleep(backoff)
             backoff = min(backoff * 2, config.WS_RECONNECT_MAX)
 
@@ -387,7 +488,7 @@ async def task_ob_fut(native_fut: list[str]):
             for sym in chunk:
                 msg = {
                     "time": int(time.time()),
-                    "channel": "futures.order_book_update",
+                    "channel": "futures.order_book",
                     "event": "subscribe",
                     "payload": [sym, "100ms", "10"],
                 }
@@ -416,6 +517,7 @@ async def task_fr(native_fut: list[str]):
 
     while True:
         try:
+            log.info(_evt("ws_connect", exchange="gate", stream="fr", url=_WS_FUTURES))
             async with websockets.connect(
                 _WS_FUTURES,
                 ping_interval=config.WS_PING_INTERVAL,
@@ -423,7 +525,8 @@ async def task_fr(native_fut: list[str]):
                 close_timeout=config.WS_CLOSE_TIMEOUT,
                 max_size=config.WS_MAX_SIZE,
             ) as ws:
-                log.info(f"[fr] Connected. symbols={len(native_fut)}")
+                log.info(_evt("ws_connected", exchange="gate", stream="fr",
+                              symbols=len(native_fut)))
                 backoff = config.WS_RECONNECT_INIT
                 await subscribe(ws)
 
@@ -439,8 +542,10 @@ async def task_fr(native_fut: list[str]):
             raise
         except Exception as exc:
             stats["reconnects"] += 1
-            log.warning(f"[fr] WS error: {type(exc).__name__}: {exc}. "
-                        f"Reconnecting in {backoff}s...")
+            log.warning(_evt("ws_disconnect", exchange="gate", stream="fr",
+                             error_type=type(exc).__name__, error_msg=str(exc),
+                             reconnect_backoff_s=backoff,
+                             reconnects_total=stats["reconnects"]))
             await asyncio.sleep(backoff)
             backoff = min(backoff * 2, config.WS_RECONNECT_MAX)
 
@@ -467,6 +572,15 @@ async def task_flusher(redis: aioredis.Redis):
         batch_buffer.clear()
         cmd_counter = 0
 
+        # measure age of oldest pending entry before flushing
+        if buffer_write_ts:
+            oldest_write = min(buffer_write_ts.values())
+            age_ms = (time.monotonic() - oldest_write) * 1000
+            stats["buffer_age_sum"] += age_ms
+            if age_ms > stats["buffer_age_max"]:
+                stats["buffer_age_max"] = age_ms
+        buffer_write_ts.clear()
+
         t_start = time.monotonic()
         pipe = redis.pipeline(transaction=False)
         for key, fields in current_batch.items():
@@ -475,7 +589,8 @@ async def task_flusher(redis: aioredis.Redis):
         try:
             await pipe.execute()
         except Exception as exc:
-            log.error(f"Redis pipeline error: {exc}")
+            log.error(_evt("redis_error", exchange="gate", pipeline_type="primary",
+                           error_type=type(exc).__name__, error_msg=str(exc)))
 
         flush_lat_ms = (time.monotonic() - t_start) * 1000
         stats["flushes"]       += 1
@@ -484,7 +599,10 @@ async def task_flusher(redis: aioredis.Redis):
         stats["batch_sum"]     += len(current_batch)
 
         if flush_lat_ms > 50:
-            log.warning(f"Slow primary flush: {flush_lat_ms:.1f}ms keys={len(current_batch)}")
+            stats["flush_slow_count"] += 1
+            log.warning(_evt("slow_flush", exchange="gate", flush_type="primary",
+                             lat_ms=round(flush_lat_ms, 1), threshold_ms=50.0,
+                             cmds=len(current_batch)))
 
 
 # ── Hist flusher (lpush, independent 300ms timer) ──────────────────────────
@@ -505,23 +623,31 @@ async def task_hist_flusher(redis: aioredis.Redis):
         if new_chunk_id != last_chunk_id:
             expire_set.clear()
             ob_hist_last_ts.clear()
-            log.info(f"Chunk changed: {last_chunk_id} → {new_chunk_id}")
+            log.info(_evt("chunk_rotate", exchange="gate",
+                          chunk_id_prev=last_chunk_id, chunk_id_new=new_chunk_id,
+                          expire_keys_reset=len(expire_set)))
             last_chunk_id = new_chunk_id
 
         t_start = time.monotonic()
-        pipe = redis.pipeline(transaction=False)
         expire_cmds = 0
-        for hist_key, line in current_hist:
-            pipe.lpush(hist_key, line)
-            if hist_key not in expire_set:
-                pipe.expire(hist_key, config.CHUNK_TTL)
-                expire_set.add(hist_key)
-                expire_cmds += 1
+        total_sent  = 0
 
-        try:
-            await pipe.execute()
-        except Exception as exc:
-            log.error(f"Redis hist pipeline error: {exc}")
+        for i in range(0, len(current_hist), config.HIST_FLUSH_CHUNK):
+            chunk = current_hist[i:i + config.HIST_FLUSH_CHUNK]
+            pipe = redis.pipeline(transaction=False)
+            for hist_key, line in chunk:
+                pipe.lpush(hist_key, line)
+                if hist_key not in expire_set:
+                    pipe.expire(hist_key, config.CHUNK_TTL)
+                    expire_set.add(hist_key)
+                    expire_cmds += 1
+            try:
+                await pipe.execute()
+            except Exception as exc:
+                log.error(_evt("redis_error", exchange="gate", pipeline_type="history",
+                               error_type=type(exc).__name__, error_msg=str(exc)))
+            total_sent += len(chunk)
+            await asyncio.sleep(0)
 
         flush_lat_ms = (time.monotonic() - t_start) * 1000
         stats["hist_flushes"]       += 1
@@ -530,38 +656,74 @@ async def task_hist_flusher(redis: aioredis.Redis):
         stats["hist_cmds"]          += len(current_hist)
 
         if flush_lat_ms > 100:
-            log.warning(
-                f"Slow hist flush: {flush_lat_ms:.1f}ms "
-                f"cmds={len(current_hist)} expire_new={expire_cmds}"
-            )
+            stats["hist_flush_slow_count"] += 1
+            log.warning(_evt("slow_flush", exchange="gate", flush_type="history",
+                             lat_ms=round(flush_lat_ms, 1), threshold_ms=100.0,
+                             cmds=len(current_hist), expire_cmds=expire_cmds))
 
 
 async def task_metrics():
     interval = config.METRICS_LOG_INTERVAL
     while True:
         await asyncio.sleep(interval)
-        n  = stats["flushes"] or 1
-        nh = stats["hist_flushes"] or 1
-        log.info(
-            f"METRICS | "
-            f"md={stats['md_msgs'] / interval:.0f}msg/s "
-            f"ob={stats['ob_msgs'] / interval:.0f}msg/s "
-            f"fr={stats['fr_msgs'] / interval:.0f}msg/s | "
-            f"flush_lat avg={stats['flush_lat_sum'] / n:.1f}ms "
-            f"max={stats['flush_lat_max']:.1f}ms "
-            f"batch_avg={stats['batch_sum'] / n:.0f} | "
-            f"hist_writes={stats['hist_cmds'] / interval:.0f}/s "
-            f"hist_flush_lat avg={stats['hist_flush_lat_sum'] / nh:.1f}ms "
-            f"max={stats['hist_flush_lat_max']:.1f}ms "
-            f"ob_skip={stats['ob_hist_skipped'] / interval:.0f}/s | "
-            f"expire_set={len(expire_set)} "
-            f"reconnects={stats['reconnects']}"
-        )
-        stats["md_msgs"] = stats["ob_msgs"] = stats["fr_msgs"] = 0
-        stats["hist_cmds"] = stats["ob_hist_skipped"] = 0
-        stats["flushes"] = stats["flush_lat_sum"] = stats["flush_lat_max"] = 0
-        stats["batch_sum"] = 0
-        stats["hist_flushes"] = stats["hist_flush_lat_sum"] = stats["hist_flush_lat_max"] = 0
+        n  = max(stats["flushes"], 1)
+        nh = max(stats["hist_flushes"], 1)
+        nm = max(stats["md_msgs"] + stats["ob_msgs"] + stats["fr_msgs"], 1)
+
+        log.info(_evt("metrics_interval", exchange="gate",
+            interval_s=round(interval, 1),
+            ingestion={
+                "md_msgs":            stats["md_msgs"],
+                "md_msgs_per_s":      round(stats["md_msgs"] / interval, 1),
+                "ob_msgs":            stats["ob_msgs"],
+                "ob_msgs_per_s":      round(stats["ob_msgs"] / interval, 1),
+                "fr_msgs":            stats["fr_msgs"],
+                "fr_msgs_per_s":      round(stats["fr_msgs"] / interval, 1),
+                "parse_errors":       stats["parse_errors"],
+                "parse_errors_per_s": round(stats["parse_errors"] / interval, 1),
+            },
+            primary_flush={
+                "count":       stats["flushes"],
+                "count_per_s": round(stats["flushes"] / interval, 1),
+                "batch_avg":   round(stats["batch_sum"] / n, 1),
+                "lat_avg_ms":  round(stats["flush_lat_sum"] / n, 1),
+                "lat_max_ms":  round(stats["flush_lat_max"], 1),
+                "slow_count":  stats["flush_slow_count"],
+            },
+            history_flush={
+                "count":        stats["hist_flushes"],
+                "count_per_s":  round(stats["hist_flushes"] / interval, 1),
+                "cmds_total":   stats["hist_cmds"],
+                "cmds_per_s":   round(stats["hist_cmds"] / interval, 1),
+                "lat_avg_ms":   round(stats["hist_flush_lat_sum"] / nh, 1),
+                "lat_max_ms":   round(stats["hist_flush_lat_max"], 1),
+                "slow_count":   stats["hist_flush_slow_count"],
+                "ob_skipped":   stats["ob_hist_skipped"],
+                "ob_skipped_per_s": round(stats["ob_hist_skipped"] / interval, 1),
+            },
+            latency={
+                "parse_avg_us":      round(stats["parse_lat_sum"] / nm, 1),
+                "parse_max_us":      round(stats["parse_lat_max"], 1),
+                "buffer_age_avg_ms": round(stats["buffer_age_sum"] / n, 1),
+                "buffer_age_max_ms": round(stats["buffer_age_max"], 1),
+                "e2e_avg_ms":        round(stats["e2e_lat_sum"] / max(stats["e2e_lat_count"], 1), 1),
+                "e2e_max_ms":        round(stats["e2e_lat_max"], 1),
+            },
+            state={
+                "expire_keys_tracked": len(expire_set),
+                "reconnects":          stats["reconnects"],
+                "active_streams":      sum(1 for t in asyncio.all_tasks()
+                                           if t.get_name().startswith("ws_")),
+            },
+        ))
+
+        # Reset all stats including new fields
+        for k in list(stats.keys()):
+            stats[k] = 0
+        # Reset float max fields to 0.0 (explicit for clarity)
+        for k in ("flush_lat_max", "hist_flush_lat_max", "parse_lat_max",
+                  "buffer_age_max", "e2e_lat_max"):
+            stats[k] = 0.0
 
 
 # ── Entry point ────────────────────────────────────────────────────────────
@@ -587,36 +749,38 @@ async def main():
     native_spot = [spot_map[s] for s in norm_spot if s in spot_map]
     native_fut  = [fut_map[s]  for s in norm_fut  if s in fut_map]
 
-    log.info(
-        f"Starting collector_gate | "
-        f"spot={len(native_spot)} fut={len(native_fut)} | "
-        f"HISTORY_ENABLED={config.HISTORY_ENABLED}"
-    )
+    if not native_spot and not native_fut:
+        log.error(_evt("no_symbols", exchange="gate"))
+        return
+
+    log.info(_evt("collector_start", exchange="gate",
+                  spot_symbols=len(native_spot), fut_symbols=len(native_fut),
+                  history_enabled=config.HISTORY_ENABLED))
 
     redis_pool = aioredis.ConnectionPool.from_url(config.REDIS_URL, max_connections=10)
     redis      = aioredis.Redis(connection_pool=redis_pool)
 
     tasks = [
-        asyncio.create_task(task_md_spot(native_spot)),
-        asyncio.create_task(task_md_fut(native_fut)),
-        asyncio.create_task(task_ob_spot(native_spot)),
-        asyncio.create_task(task_ob_fut(native_fut)),
-        asyncio.create_task(task_fr(native_fut)),
-        asyncio.create_task(task_flusher(redis)),
-        asyncio.create_task(task_hist_flusher(redis)),
-        asyncio.create_task(task_metrics()),
+        asyncio.create_task(task_md_spot(native_spot), name="ws_md_spot"),
+        asyncio.create_task(task_md_fut(native_fut),   name="ws_md_fut"),
+        asyncio.create_task(task_ob_spot(native_spot), name="ws_ob_spot"),
+        asyncio.create_task(task_ob_fut(native_fut),   name="ws_ob_fut"),
+        asyncio.create_task(task_fr(native_fut),       name="ws_fr"),
+        asyncio.create_task(task_flusher(redis),       name="flusher"),
+        asyncio.create_task(task_hist_flusher(redis),  name="hist_flusher"),
+        asyncio.create_task(task_metrics(),            name="metrics"),
     ]
 
     try:
         await asyncio.gather(*tasks)
     except KeyboardInterrupt:
-        log.info("KeyboardInterrupt — shutting down")
+        log.info(_evt("collector_stop", exchange="gate", reason="KeyboardInterrupt"))
     finally:
         for t in tasks:
             t.cancel()
         await redis.aclose()
         await redis_pool.aclose()
-        log.info("collector_gate stopped")
+        log.info(_evt("collector_stop", exchange="gate", reason="stopped"))
 
 
 if __name__ == "__main__":
