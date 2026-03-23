@@ -28,6 +28,11 @@ from logger_setup import setup_logger
 
 log = setup_logger("launcher")
 
+_COMPONENT = "launcher"
+
+def _evt(event: str, **kwargs) -> dict:
+    return {"ts": int(time.time() * 1000), "component": _COMPONENT, "event": event, **kwargs}
+
 # ── Process definitions ─────────────────────────────────────────────────────
 
 PROCESSES: dict[str, str] = {
@@ -62,12 +67,13 @@ def check_redis():
             r = sync_redis.Redis.from_url(config.REDIS_URL)
             r.ping()
             r.close()
-            log.info(f"Redis OK at {config.REDIS_URL}")
+            log.info(_evt("redis_ready", url=config.REDIS_URL, attempt=attempt))
             return
         except Exception as exc:
-            log.warning(f"Redis not ready (attempt {attempt}/10): {exc}")
+            log.warning(_evt("redis_unavailable", url=config.REDIS_URL,
+                             attempt=attempt, error_msg=str(exc)))
             time.sleep(2)
-    log.error("Redis unreachable after 10 attempts — aborting")
+    log.error(_evt("redis_not_ready", url=config.REDIS_URL, attempts=10))
     sys.exit(1)
 
 
@@ -78,7 +84,7 @@ def flush_redis():
     count = r.dbsize()
     r.flushdb()
     r.close()
-    log.info(f"Redis flushed ({count} keys removed)")
+    log.info(_evt("redis_flushed", keys_removed=count))
 
 
 def check_subscribe_files():
@@ -87,52 +93,51 @@ def check_subscribe_files():
         for market in ["spot", "futures"]:
             path = Path(f"{config.SUBSCRIBE_DIR}/{exch}/{exch}_{market}.txt")
             if not path.exists():
-                log.warning(f"Subscribe file missing: {path}")
+                log.warning(_evt("subscribe_file_missing", path=str(path)))
             else:
                 count = sum(1 for l in path.read_text().splitlines() if l.strip())
-                log.info(f"Subscribe file OK: {path} ({count} symbols)")
+                log.info(_evt("subscribe_file_ok", path=str(path), count=count))
 
 
 def ensure_redis():
     """Start Redis via setup script if not already running."""
     script = Path(__file__).parent / "scripts" / "redis_setup.sh"
-    log.info(f"Running Redis setup: {script}")
+    log.info(_evt("redis_setup_start", script=str(script)))
     result = subprocess.run(["bash", str(script)], capture_output=True, text=True)
     if result.stdout:
-        log.info(result.stdout.strip())
+        log.info(_evt("redis_setup_stdout", output=result.stdout.strip()))
     if result.stderr:
-        log.debug(result.stderr.strip())
+        log.debug(_evt("redis_setup_stderr", output=result.stderr.strip()))
     if result.returncode != 0:
-        log.error(f"Redis setup script failed:\n{result.stderr}")
+        log.error(_evt("redis_setup_failed", script=str(script), stderr=result.stderr))
         sys.exit(1)
 
 
 def start_process(name: str, script: str) -> subprocess.Popen:
-    log.info(f"Starting {name} ({script})...")
     p = subprocess.Popen(
         [sys.executable, script],
         stdout=subprocess.DEVNULL,
         stderr=subprocess.DEVNULL,
     )
-    log.info(f"Started {name} PID={p.pid}")
+    log.info(_evt("process_started", name=name, pid=p.pid, script=script))
     return p
 
 
 def handle_sigterm(signum, frame):
-    log.info(f"Signal {signum} received — shutting down all processes...")
+    log.info(_evt("shutdown", signal=str(signum)))
     for name, p in _procs.items():
         try:
             p.terminate()
-            log.info(f"Terminated {name} PID={p.pid}")
+            log.info(_evt("process_terminated", name=name, pid=p.pid))
         except Exception as exc:
-            log.warning(f"Failed to terminate {name}: {exc}")
+            log.warning(_evt("terminate_failed", name=name, error_msg=str(exc)))
     # Give processes time to clean up
     time.sleep(3)
     for name, p in _procs.items():
         if p.poll() is None:
             p.kill()
-            log.info(f"Killed {name} PID={p.pid}")
-    log.info("Shutdown complete")
+            log.info(_evt("process_killed", name=name, pid=p.pid))
+    log.info(_evt("shutdown_complete"))
     sys.exit(0)
 
 
@@ -152,11 +157,9 @@ def ask_spread_delay() -> int:
 
 
 def main():
-    log.info(
-        f"BALI 5.0 launcher starting | "
-        f"HISTORY_ENABLED={config.HISTORY_ENABLED} "
-        f"processes={list(PROCESSES.keys())}"
-    )
+    log.info(_evt("launcher_start",
+                  history_enabled=config.HISTORY_ENABLED,
+                  processes=list(PROCESSES.keys())))
 
     # Register signal handlers
     signal.signal(signal.SIGTERM, handle_sigterm)
@@ -165,7 +168,7 @@ def main():
     # Interactive prompt before startup
     spread_delay = ask_spread_delay()
     if spread_delay:
-        log.info(f"spread_monitor will start in {spread_delay}s after other monitors")
+        log.info(_evt("spread_monitor_delay", seconds=spread_delay))
 
     # Pre-flight checks
     ensure_redis()
@@ -190,7 +193,7 @@ def main():
         _procs[name] = start_process(name, script)
         time.sleep(0.5)
 
-    log.info(f"Waiting {COLLECTOR_WARMUP}s for collectors to populate Redis...")
+    log.info(_evt("warmup_wait", seconds=COLLECTOR_WARMUP))
     time.sleep(COLLECTOR_WARMUP)
 
     monitors_without_spread = {
@@ -203,11 +206,11 @@ def main():
 
     if "spread_monitor" in monitors:
         if spread_delay > 0:
-            log.info(f"Waiting {spread_delay}s before starting spread_monitor...")
+            log.info(_evt("spread_monitor_waiting", seconds=spread_delay))
             time.sleep(spread_delay)
         _procs["spread_monitor"] = start_process("spread_monitor", monitors["spread_monitor"])
 
-    log.info("All processes started. Health check every 30s.")
+    log.info(_evt("all_started", health_check_interval_s=30))
 
     # Health check loop
     restart_counts: dict[str, int] = {name: 0 for name in PROCESSES}
@@ -218,14 +221,13 @@ def main():
         for name, p in list(_procs.items()):
             if p.poll() is not None:   # process exited
                 restart_counts[name] = restart_counts.get(name, 0) + 1
-                log.error(
-                    f"Process {name} (PID={p.pid}) died "
-                    f"(exit={p.returncode}) — "
-                    f"restarting (attempt #{restart_counts[name]})..."
-                )
+                log.error(_evt("process_died", name=name, pid=p.pid,
+                               exit_code=p.returncode, restart_attempt=restart_counts[name]))
                 script = PROCESSES[name]
                 new_p  = start_process(name, script)
                 _procs[name] = new_p
+                log.info(_evt("process_restarted", name=name, pid=new_p.pid,
+                              restart_attempt=restart_counts[name]))
 
 
 if __name__ == "__main__":
