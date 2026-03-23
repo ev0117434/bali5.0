@@ -20,9 +20,10 @@ sys.path.insert(0, str(Path(__file__).parent.parent))
 
 @pytest.fixture(scope="module")
 def redis_client():
+    import config
     import redis
-    r = redis.Redis.from_url("redis://localhost:6379")
     try:
+        r = redis.Redis.from_url(config.REDIS_URL)
         r.ping()
     except Exception:
         pytest.skip("Redis not available")
