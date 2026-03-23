@@ -8,7 +8,7 @@ from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).parent.parent))
 
-from collectors.collector_binance import parse_md, parse_ob, parse_fr
+from collectors.collector_binance import parse_md, parse_ob, parse_ob_fut, parse_fr
 
 
 # ── parse_md ───────────────────────────────────────────────────────────────
@@ -101,6 +101,67 @@ class TestParseOb:
 
     def test_invalid_json_returns_none(self):
         assert parse_ob("{bad json") is None
+
+
+# ── parse_ob_fut ───────────────────────────────────────────────────────────
+
+class TestParseObFut:
+    def test_futures_depth_update_format(self):
+        """Binance futures uses depthUpdate with b/a keys, NOT bids/asks."""
+        bids = [["34000.10", "10.5"], ["33999.00", "5.2"]]
+        asks = [["34001.50", "8.3"], ["34002.00", "12.1"]]
+        raw = json.dumps({
+            "stream": "aiausdt@depth10@100ms",
+            "data": {
+                "e": "depthUpdate",
+                "E": 1700000000000,
+                "T": 1700000000000,
+                "s": "AIAUSDT",
+                "U": 100,
+                "u": 110,
+                "pu": 99,
+                "b": bids,
+                "a": asks,
+            }
+        })
+        result = parse_ob_fut(raw)
+        assert result is not None
+        symbol, got_bids, got_asks, ts_ms = result
+        assert symbol == "AIAUSDT"
+        assert got_bids == bids
+        assert got_asks == asks
+        assert isinstance(ts_ms, int)
+
+    def test_truncates_to_10_levels(self):
+        bids = [[str(34000 - i), "1.0"] for i in range(15)]
+        asks = [[str(34001 + i), "1.0"] for i in range(15)]
+        raw = json.dumps({
+            "stream": "btcusdt@depth10@100ms",
+            "data": {"e": "depthUpdate", "s": "BTCUSDT", "b": bids, "a": asks}
+        })
+        result = parse_ob_fut(raw)
+        assert result is not None
+        _, got_bids, got_asks, _ = result
+        assert len(got_bids) == 10
+        assert len(got_asks) == 10
+
+    def test_spot_format_returns_none(self):
+        """Spot format (bids/asks) must be rejected by parse_ob_fut."""
+        raw = json.dumps({
+            "stream": "btcusdt@depth10@100ms",
+            "data": {"lastUpdateId": 1027024, "bids": [["100", "1"]], "asks": [["101", "1"]]}
+        })
+        assert parse_ob_fut(raw) is None
+
+    def test_non_depth_update_returns_none(self):
+        raw = json.dumps({
+            "stream": "btcusdt@bookTicker",
+            "data": {"e": "bookTicker", "s": "BTCUSDT", "b": "100", "a": "101"}
+        })
+        assert parse_ob_fut(raw) is None
+
+    def test_invalid_json_returns_none(self):
+        assert parse_ob_fut("{bad json") is None
 
 
 # ── parse_fr ───────────────────────────────────────────────────────────────
@@ -286,7 +347,8 @@ class TestBufferWriters:
         import config
         config.HISTORY_ENABLED = True
         cb.write_md_to_buffer("BTCUSDT", "1.0", "2.0", 1705312345000, "spot")
-        assert cb.cmd_counter == 2  # HSET + LPUSH
+        assert cb.cmd_counter == 1  # только HSET (hist_buffer — отдельная очередь)
+        assert len(cb.hist_buffer) == 1  # LPUSH попал в hist_buffer
 
     def test_cmd_counter_without_history(self):
         import collectors.collector_binance as cb
@@ -294,3 +356,35 @@ class TestBufferWriters:
         config.HISTORY_ENABLED = False
         cb.write_md_to_buffer("BTCUSDT", "1.0", "2.0", 1705312345000, "spot")
         assert cb.cmd_counter == 1  # HSET only
+
+
+# ── New stats fields ───────────────────────────────────────────────────────
+
+class TestCollectorBinanceStats:
+    def test_stats_dict_has_new_fields(self):
+        """stats dict must contain all NEW fields required for JSON metrics."""
+        from collectors.collector_binance import stats
+        required_new = [
+            "parse_errors",
+            "parse_lat_sum", "parse_lat_max",
+            "flush_slow_count", "hist_flush_slow_count",
+            "buffer_age_sum", "buffer_age_max",
+            "e2e_lat_sum", "e2e_lat_max", "e2e_lat_count",
+        ]
+        for field in required_new:
+            assert field in stats, f"Missing stats field: {field}"
+
+    def test_parse_md_increments_parse_errors_on_bad_input(self):
+        """parse_md with invalid JSON must increment stats['parse_errors']."""
+        from collectors import collector_binance as cb
+        before = cb.stats["parse_errors"]
+        cb.parse_md("not-valid-json")
+        assert cb.stats["parse_errors"] == before + 1
+
+    def test_parse_md_increments_parse_errors_on_missing_fields(self):
+        """parse_md with missing fields must increment stats['parse_errors']."""
+        import json
+        from collectors import collector_binance as cb
+        before = cb.stats["parse_errors"]
+        cb.parse_md(json.dumps({"stream": "btcusdt@bookTicker", "data": {}}))
+        assert cb.stats["parse_errors"] == before + 1
