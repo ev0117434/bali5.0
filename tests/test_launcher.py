@@ -78,3 +78,35 @@ class TestSubscribeFiles:
                 if path.exists():
                     lines = [l.strip() for l in path.read_text().splitlines() if l.strip()]
                     assert len(lines) > 0, f"Subscribe file is empty: {path}"
+
+
+class TestEnsureRedis:
+    def test_ensure_redis_success(self, monkeypatch):
+        """ensure_redis() should not exit when script returns 0."""
+        import launcher
+        from unittest.mock import patch, MagicMock
+
+        mock_result = MagicMock()
+        mock_result.returncode = 0
+        mock_result.stdout = "[redis_setup] Redis already running"
+        mock_result.stderr = ""
+
+        with patch("launcher.subprocess.run", return_value=mock_result):
+            # Should complete without raising SystemExit
+            launcher.ensure_redis()
+
+    def test_ensure_redis_failure_exits(self, monkeypatch):
+        """ensure_redis() should call sys.exit(1) when script returns non-zero."""
+        import launcher
+        from unittest.mock import patch, MagicMock
+        import pytest
+
+        mock_result = MagicMock()
+        mock_result.returncode = 1
+        mock_result.stdout = ""
+        mock_result.stderr = "ERROR: Redis did not start"
+
+        with patch("launcher.subprocess.run", return_value=mock_result):
+            with pytest.raises(SystemExit) as exc_info:
+                launcher.ensure_redis()
+            assert exc_info.value.code == 1
