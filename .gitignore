@@ -19,3 +19,4 @@ redis.sock
 .idea/
 .vscode/
 *.egg-info/
+.claude/
