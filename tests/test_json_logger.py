@@ -1,5 +1,6 @@
 # tests/test_json_logger.py
 """Tests for JsonFormatter and setup_logger JSON output."""
+import io
 import json
 import logging
 import sys
@@ -14,18 +15,19 @@ from logger_setup import JsonFormatter, setup_logger
 
 
 class TestJsonFormatter:
-    def _make_logger(self):
-        fmt = JsonFormatter()
-        handler = logging.StreamHandler()
-        handler.setFormatter(fmt)
-        logger = logging.getLogger(f"test_{id(self)}")
-        logger.addHandler(handler)
-        logger.setLevel(logging.DEBUG)
-        return logger, handler
+    _TEST_LOGGER_NAMES = [
+        "test_dict", "test_str", "test_valid_json", "test_ts", "test_nomutate",
+        "test_exc", "test_defaults",
+    ]
 
-    def test_dict_msg_is_serialized_as_is(self, caplog):
+    @pytest.fixture(autouse=True)
+    def _clean_loggers(self):
+        yield
+        for name in self._TEST_LOGGER_NAMES:
+            logging.getLogger(name).handlers.clear()
+
+    def test_dict_msg_is_serialized_as_is(self):
         """Dict message passes through as JSON with ts/component/event preserved."""
-        import io
         stream = io.StringIO()
         fmt = JsonFormatter()
         handler = logging.StreamHandler(stream)
@@ -44,7 +46,6 @@ class TestJsonFormatter:
 
     def test_string_msg_wrapped_in_envelope(self):
         """Plain string messages get wrapped with ts/component/event=log/msg fields."""
-        import io
         stream = io.StringIO()
         fmt = JsonFormatter()
         handler = logging.StreamHandler(stream)
@@ -63,7 +64,6 @@ class TestJsonFormatter:
 
     def test_output_is_valid_json(self):
         """Every emitted line must be parseable as JSON."""
-        import io
         stream = io.StringIO()
         fmt = JsonFormatter()
         handler = logging.StreamHandler(stream)
@@ -80,7 +80,6 @@ class TestJsonFormatter:
 
     def test_ts_is_unix_milliseconds(self):
         """ts field in wrapped plain-string messages is current Unix ms."""
-        import io
         stream = io.StringIO()
         fmt = JsonFormatter()
         handler = logging.StreamHandler(stream)
@@ -97,7 +96,6 @@ class TestJsonFormatter:
 
     def test_dict_msg_not_mutated(self):
         """Original dict passed as msg is not modified."""
-        import io
         stream = io.StringIO()
         fmt = JsonFormatter()
         handler = logging.StreamHandler(stream)
@@ -110,6 +108,41 @@ class TestJsonFormatter:
         copy = dict(original)
         logger.info(original)
         assert original == copy  # not mutated
+
+    def test_exc_info_included_in_output(self):
+        """Tracebacks from exc_info are included as 'traceback' field."""
+        stream = io.StringIO()
+        fmt = JsonFormatter()
+        handler = logging.StreamHandler(stream)
+        handler.setFormatter(fmt)
+        logger = logging.getLogger("test_exc")
+        logger.addHandler(handler)
+        logger.setLevel(logging.DEBUG)
+
+        try:
+            raise ValueError("test error")
+        except ValueError:
+            logger.exception("something failed")
+
+        obj = json.loads(stream.getvalue().strip())
+        assert "traceback" in obj
+        assert "ValueError" in obj["traceback"]
+
+    def test_dict_msg_always_has_ts_and_level(self):
+        """Dict messages without ts/level get them from the log record."""
+        stream = io.StringIO()
+        fmt = JsonFormatter()
+        handler = logging.StreamHandler(stream)
+        handler.setFormatter(fmt)
+        logger = logging.getLogger("test_defaults")
+        logger.addHandler(handler)
+        logger.setLevel(logging.DEBUG)
+
+        logger.warning({"component": "x", "event": "y"})  # no ts, no level
+        obj = json.loads(stream.getvalue().strip())
+        assert "ts" in obj
+        assert obj["level"] == "WARNING"
+        assert obj["event"] == "y"  # caller's value preserved
 
     def test_setup_logger_file_handler_uses_json(self, tmp_path, monkeypatch):
         """setup_logger writes JSON to log file."""

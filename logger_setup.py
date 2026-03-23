@@ -25,6 +25,9 @@ class JsonFormatter(logging.Formatter):
         msg = record.msg
         if isinstance(msg, dict):
             payload = dict(msg)  # shallow copy — never mutate caller's dict
+            # Guarantee ts and level are always present
+            payload.setdefault("ts", int(record.created * 1000))
+            payload.setdefault("level", record.levelname)
         else:
             payload = {
                 "ts":        int(record.created * 1000),
@@ -33,6 +36,9 @@ class JsonFormatter(logging.Formatter):
                 "level":     record.levelname,
                 "msg":       record.getMessage(),
             }
+        # Include traceback if present (works for both dict and string messages)
+        if record.exc_info:
+            payload["traceback"] = self.formatException(record.exc_info)
         return json.dumps(payload, ensure_ascii=False)
 
 
