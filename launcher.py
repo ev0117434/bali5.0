@@ -90,6 +90,8 @@ def ensure_redis():
     result = subprocess.run(["bash", str(script)], capture_output=True, text=True)
     if result.stdout:
         log.info(result.stdout.strip())
+    if result.stderr:
+        log.debug(result.stderr.strip())
     if result.returncode != 0:
         log.error(f"Redis setup script failed:\n{result.stderr}")
         sys.exit(1)

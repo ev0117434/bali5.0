@@ -81,7 +81,7 @@ class TestSubscribeFiles:
 
 
 class TestEnsureRedis:
-    def test_ensure_redis_success(self, monkeypatch):
+    def test_ensure_redis_success(self):
         """ensure_redis() should not exit when script returns 0."""
         import launcher
         from unittest.mock import patch, MagicMock
@@ -95,7 +95,7 @@ class TestEnsureRedis:
             # Should complete without raising SystemExit
             launcher.ensure_redis()
 
-    def test_ensure_redis_failure_exits(self, monkeypatch):
+    def test_ensure_redis_failure_exits(self):
         """ensure_redis() should call sys.exit(1) when script returns non-zero."""
         import launcher
         from unittest.mock import patch, MagicMock
