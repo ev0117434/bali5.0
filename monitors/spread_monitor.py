@@ -6,7 +6,7 @@ BALI 5.0 — Spread monitor.
 Scans all spot×futures pairs every 300ms via a single Redis pipeline.
 If spread_pct >= SPREAD_THRESHOLD and cooldown not active:
   - appends line to signal/signal.csv
-  - publishes to Redis ch:signals (for snapshot_monitor)
+  - writes to Redis Stream stream:signals (for snapshot_monitor)
 
 Spread formula: (bid_futures - ask_spot) / ask_spot * 100
 Positive spread means futures trade ABOVE spot → cash-and-carry opportunity.
@@ -120,8 +120,13 @@ async def handle_signal(
         async with aiofiles.open(config.SIGNAL_CSV, "a") as f:
             await f.write(signal_line + "\n")
 
-    # Publish to Redis pub/sub for snapshot_monitor
-    await redis.publish(config.CHANNEL_SIGNALS, signal_line)
+    # Write to Redis Stream for snapshot_monitor (buffered, survives restarts)
+    await redis.xadd(
+        config.STREAM_SIGNALS,
+        {"data": signal_line},
+        maxlen=config.STREAM_SIGNALS_MAXLEN,
+        approximate=True,
+    )
 
     log.info(
         f"SIGNAL | {spot_exch}→{fut_exch} {symbol} "

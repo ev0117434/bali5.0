@@ -3,7 +3,8 @@
 """
 BALI 5.0 — Snapshot monitor (data branch only).
 
-Subscribes to Redis ch:signals pub/sub channel.
+Reads signals from Redis Stream stream:signals (XREAD with blocking).
+Persists last-read cursor in snapshot:stream_id — survives crashes without losing signals.
 On signal: loads 1h of historical data, then records real-time snapshot for 3500s.
 
 Each snapshot file: signal/snapshot/{spot}_{fut}_{symbol}_{ts}.csv
@@ -357,39 +358,71 @@ async def run_snapshot(redis_data: aioredis.Redis, signal_str: str):
     log.info(f"Snapshot done: {fname} | rows={row_count} elapsed={elapsed:.0f}s")
 
 
-# ── Subscribe loop ─────────────────────────────────────────────────────────
+# ── Stream read loop ───────────────────────────────────────────────────────
 
 async def subscribe_loop(redis_sub: aioredis.Redis, redis_data: aioredis.Redis):
+    """
+    Reads signals from Redis Stream instead of pub/sub.
+    Persists last-read ID so missed signals are replayed after a crash.
+    """
     active_snapshots: dict = {}
 
-    pubsub = redis_sub.pubsub()
-    await pubsub.subscribe(config.CHANNEL_SIGNALS)
-    log.info(f"Subscribed to {config.CHANNEL_SIGNALS}")
+    # Resume from last processed ID, or start from current tip on first run
+    last_id_raw = await redis_sub.get(config.STREAM_LAST_ID_KEY)
+    if last_id_raw:
+        last_id = last_id_raw.decode()
+        log.info(f"Resuming stream from id={last_id}")
+    else:
+        last_id = "$"
+        log.info("First run: starting from current stream position")
 
-    async for message in pubsub.listen():
-        if message["type"] != "message":
+    log.info(f"Reading stream {config.STREAM_SIGNALS} (block=2s)")
+
+    while True:
+        try:
+            results = await redis_sub.xread(
+                {config.STREAM_SIGNALS: last_id},
+                count=100,
+                block=2000,   # ждём до 2 сек новых сообщений
+            )
+        except Exception as exc:
+            log.error(f"XREAD error: {exc}")
+            await asyncio.sleep(1)
             continue
 
-        signal_str = message["data"]
-        if isinstance(signal_str, bytes):
-            signal_str = signal_str.decode()
-
-        log.info(f"Signal received: {signal_str}")
-
-        signal_ts = signal_str.split(",")[6] if len(signal_str.split(",")) >= 7 else str(int(time.time() * 1000))
-
-        # Don't start duplicate snapshot for same signal
-        if signal_ts in active_snapshots and not active_snapshots[signal_ts].done():
-            log.debug(f"Snapshot for signal_ts={signal_ts} already running")
+        if not results:
             continue
 
-        task = asyncio.create_task(run_snapshot(redis_data, signal_str))
-        active_snapshots[signal_ts] = task
+        for _stream_name, messages in results:
+            for msg_id, fields in messages:
+                msg_id_str = msg_id.decode() if isinstance(msg_id, bytes) else msg_id
 
-        # Clean up completed tasks
-        for sid in list(active_snapshots):
-            if active_snapshots[sid].done():
-                del active_snapshots[sid]
+                signal_str = fields.get(b"data") or fields.get("data", b"")
+                if isinstance(signal_str, bytes):
+                    signal_str = signal_str.decode()
+
+                log.info(f"Signal received (id={msg_id_str}): {signal_str}")
+
+                parts = signal_str.split(",")
+                if len(parts) >= 7:
+                    snap_key = f"{parts[0]}_{parts[1]}_{parts[2]}_{parts[6]}"
+                else:
+                    snap_key = msg_id_str
+
+                if snap_key in active_snapshots and not active_snapshots[snap_key].done():
+                    log.debug(f"Snapshot {snap_key} already running")
+                else:
+                    task = asyncio.create_task(run_snapshot(redis_data, signal_str))
+                    active_snapshots[snap_key] = task
+
+                # Persist cursor so we can resume after a crash
+                last_id = msg_id_str
+                await redis_sub.set(config.STREAM_LAST_ID_KEY, last_id)
+
+                # Clean up completed tasks
+                for k in list(active_snapshots):
+                    if active_snapshots[k].done():
+                        del active_snapshots[k]
 
 
 # ── Entry point ────────────────────────────────────────────────────────────

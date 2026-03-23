@@ -99,8 +99,10 @@ SNAPSHOT_CSV_HEADER = (
     "f_aq1,f_aq2,f_aq3,f_aq4,f_aq5,f_aq6,f_aq7,f_aq8,f_aq9,f_aq10"
 )
 
-# ── Redis Pub/Sub каналы ───────────────────────────────────────────────────
-CHANNEL_SIGNALS = "ch:signals"
+# ── Redis Stream (сигналы spread → snapshot) ──────────────────────────────
+STREAM_SIGNALS          = "stream:signals"
+STREAM_SIGNALS_MAXLEN   = 1000   # хранить не более N последних сигналов
+STREAM_LAST_ID_KEY      = "snapshot:stream_id"  # куда snapshot_monitor пишет свой курсор
 
 # ── Metrics ───────────────────────────────────────────────────────────────
 METRICS_LOG_INTERVAL = 5   # сек: как часто логировать метрики коллекторов

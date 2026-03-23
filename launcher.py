@@ -71,6 +71,16 @@ def check_redis():
     sys.exit(1)
 
 
+def flush_redis():
+    """Flush all keys from Redis DB."""
+    import redis as sync_redis
+    r = sync_redis.Redis.from_url(config.REDIS_URL)
+    count = r.dbsize()
+    r.flushdb()
+    r.close()
+    log.info(f"Redis flushed ({count} keys removed)")
+
+
 def check_subscribe_files():
     exchanges = ["binance", "bybit", "okx", "gate", "bitget"]
     for exch in exchanges:
@@ -128,6 +138,19 @@ def handle_sigterm(signum, frame):
 
 # ── Main ───────────────────────────────────────────────────────────────────
 
+def ask_spread_delay() -> int:
+    """Prompt user for spread_monitor start delay in seconds. 0 = start with others."""
+    print("\nSpread monitor start delay (seconds, 0 = with other monitors): ", end="", flush=True)
+    try:
+        val = input().strip()
+        delay = int(val) if val else 0
+        if delay < 0:
+            delay = 0
+    except (ValueError, EOFError):
+        delay = 0
+    return delay
+
+
 def main():
     log.info(
         f"BALI 5.0 launcher starting | "
@@ -139,9 +162,15 @@ def main():
     signal.signal(signal.SIGTERM, handle_sigterm)
     signal.signal(signal.SIGINT,  handle_sigterm)
 
+    # Interactive prompt before startup
+    spread_delay = ask_spread_delay()
+    if spread_delay:
+        log.info(f"spread_monitor will start in {spread_delay}s after other monitors")
+
     # Pre-flight checks
     ensure_redis()
     check_redis()
+    flush_redis()
     os.makedirs(config.LOGS_DIR,    exist_ok=True)
     os.makedirs(config.SIGNAL_DIR,  exist_ok=True)
     os.makedirs(config.SNAPSHOT_DIR, exist_ok=True)
@@ -164,9 +193,19 @@ def main():
     log.info(f"Waiting {COLLECTOR_WARMUP}s for collectors to populate Redis...")
     time.sleep(COLLECTOR_WARMUP)
 
-    for name, script in monitors.items():
+    monitors_without_spread = {
+        name: script for name, script in monitors.items()
+        if name != "spread_monitor"
+    }
+    for name, script in monitors_without_spread.items():
         _procs[name] = start_process(name, script)
         time.sleep(0.5)
+
+    if "spread_monitor" in monitors:
+        if spread_delay > 0:
+            log.info(f"Waiting {spread_delay}s before starting spread_monitor...")
+            time.sleep(spread_delay)
+        _procs["spread_monitor"] = start_process("spread_monitor", monitors["spread_monitor"])
 
     log.info("All processes started. Health check every 30s.")
 

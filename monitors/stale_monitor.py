@@ -40,8 +40,14 @@ async def monitor_loop(redis: aioredis.Redis):
         total     = 0
 
         async for key in redis.scan_iter("md:*", count=100):
+            if key.startswith(b"md:hist:"):
+                continue
             total += 1
-            ts_raw = await redis.hget(key, "ts")
+            try:
+                ts_raw = await redis.hget(key, "ts")
+            except aioredis.ResponseError:
+                log.debug(f"Key {key.decode()} is not a hash, skipping")
+                continue
             if ts_raw is None:
                 log.debug(f"Key {key.decode()} has no ts field")
                 continue
