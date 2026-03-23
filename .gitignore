@@ -12,6 +12,8 @@ dictionaries/subscribe/
 logs/
 signal/signal.csv
 signal/snapshot/
+# Redis unix socket (runtime file — not committed)
+redis.sock
 
 # IDE
 .idea/
