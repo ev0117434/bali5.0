@@ -1,9 +1,12 @@
 # logger_setup.py
 """
 BALI 5.0 — Настройка логирования.
-Единственная функция: setup_logger(name) → logging.Logger
+
+File handler: NDJSON (one JSON object per line, machine-readable).
+Console handler: human-readable text (WARNING+ only).
 """
 
+import json
 import logging
 import os
 from logging.handlers import RotatingFileHandler
@@ -11,28 +14,44 @@ from logging.handlers import RotatingFileHandler
 import config
 
 
+class JsonFormatter(logging.Formatter):
+    """Formats log records as single-line JSON (NDJSON).
+
+    - If record.msg is a dict: serialize it directly.
+    - If record.msg is str/other: wrap in envelope with ts, component, event='log', level, msg.
+    """
+
+    def format(self, record: logging.LogRecord) -> str:
+        msg = record.msg
+        if isinstance(msg, dict):
+            payload = dict(msg)  # shallow copy — never mutate caller's dict
+        else:
+            payload = {
+                "ts":        int(record.created * 1000),
+                "component": record.name,
+                "event":     "log",
+                "level":     record.levelname,
+                "msg":       record.getMessage(),
+            }
+        return json.dumps(payload, ensure_ascii=False)
+
+
 def setup_logger(name: str) -> logging.Logger:
     """
     Создаёт и возвращает логгер с именем `name`.
 
-    - Файл: logs/{name}.log, RotatingFileHandler 10MB × 5 файлов, уровень DEBUG
-    - Консоль: StreamHandler, уровень WARNING
-    - Формат: [YYYY-MM-DD HH:MM:SS.mmm] [LEVEL    ] [name] message
+    - Файл: logs/{name}.log  — NDJSON, RotatingFileHandler 10MB × 5, уровень DEBUG
+    - Консоль: StreamHandler — текст, уровень WARNING
     """
     os.makedirs(config.LOGS_DIR, exist_ok=True)
 
     logger = logging.getLogger(name)
     if logger.handlers:
-        return logger  # уже настроен, не дублировать
+        return logger  # already configured, don't duplicate
 
     logger.setLevel(logging.DEBUG)
 
-    fmt = logging.Formatter(
-        fmt="[%(asctime)s.%(msecs)03d] [%(levelname)-8s] [%(name)s] %(message)s",
-        datefmt="%Y-%m-%d %H:%M:%S",
-    )
-
-    # Файловый обработчик
+    # ── File handler: NDJSON ──────────────────────────────────────────────
     fh = RotatingFileHandler(
         filename=os.path.join(config.LOGS_DIR, f"{name}.log"),
         maxBytes=10 * 1024 * 1024,  # 10 MB
@@ -40,13 +59,17 @@ def setup_logger(name: str) -> logging.Logger:
         encoding="utf-8",
     )
     fh.setLevel(logging.DEBUG)
-    fh.setFormatter(fmt)
+    fh.setFormatter(JsonFormatter())
     logger.addHandler(fh)
 
-    # Консольный обработчик
+    # ── Console handler: human-readable text (WARNING+) ──────────────────
+    text_fmt = logging.Formatter(
+        fmt="[%(asctime)s.%(msecs)03d] [%(levelname)-8s] [%(name)s] %(message)s",
+        datefmt="%Y-%m-%d %H:%M:%S",
+    )
     ch = logging.StreamHandler()
     ch.setLevel(logging.WARNING)
-    ch.setFormatter(fmt)
+    ch.setFormatter(text_fmt)
     logger.addHandler(ch)
 
     return logger

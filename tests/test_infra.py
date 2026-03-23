@@ -57,6 +57,7 @@ def test_logger_creates_file(tmp_path, monkeypatch):
 
 
 def test_logger_format(tmp_path, monkeypatch):
+    import json
     import config
     monkeypatch.setattr(config, "LOGS_DIR", str(tmp_path))
 
@@ -67,10 +68,14 @@ def test_logger_format(tmp_path, monkeypatch):
     log = logger_setup.setup_logger("test_format")
     log.debug("format_check")
 
-    content = (tmp_path / "test_format.log").read_text()
-    assert "[DEBUG   ]" in content
-    assert "[test_format]" in content
-    assert "format_check" in content
+    content = (tmp_path / "test_format.log").read_text().strip()
+    # File handler now emits NDJSON — validate JSON structure
+    obj = json.loads(content)
+    assert obj["level"] == "DEBUG"
+    assert obj["component"] == "test_format"
+    assert obj["msg"] == "format_check"
+    assert obj["event"] == "log"
+    assert "ts" in obj
 
 
 def test_redis_connection():
