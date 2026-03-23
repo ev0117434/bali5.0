@@ -31,6 +31,36 @@ from logger_setup import setup_logger
 
 log = setup_logger("spread_monitor")
 
+_COMPONENT = "spread_monitor"
+
+
+def _evt(event: str, **kwargs) -> dict:
+    return {"ts": int(time.time() * 1000), "component": _COMPONENT, "event": event, **kwargs}
+
+
+def _p99(values: list) -> float:
+    """Compute 99th percentile using statistics.quantiles (stdlib, Python 3.8+)."""
+    from statistics import quantiles
+    if len(values) < 2:
+        return round(values[0], 1) if values else 0.0
+    return round(quantiles(values, n=100)[98], 1)  # index 98 = 99th percentile
+
+
+# ── Summary state ──────────────────────────────────────────────────────────
+
+_summary: dict = {
+    "cycles": 0,
+    "cycle_lat_sum": 0.0,
+    "cycle_lat_max": 0.0,
+    "cycle_lats": [],       # list of floats for p99 calculation
+    "slow_cycles": 0,
+    "signals": 0,
+    "no_data_sum": 0,
+    "stale_sum": 0,
+    "_last_summary_ts": 0.0,  # will be set on first use
+}
+_SUMMARY_INTERVAL = 30.0
+
 
 # ── Load combination pairs ─────────────────────────────────────────────────
 
@@ -56,14 +86,18 @@ def load_pairs() -> list[tuple[str, str, str]]:
     files   = glob.glob(pattern)
 
     if not files:
-        log.warning(f"No combination files found in {config.COMBINATION_DIR}")
+        log.warning(_evt("no_pairs",
+                         combination_dir=str(config.COMBINATION_DIR),
+                         retry_in_s=60))
         return []
 
     for fname in files:
         try:
             spot_exch, fut_exch = _parse_combo_filename(fname)
         except (IndexError, ValueError) as exc:
-            log.warning(f"Could not parse combo filename {fname}: {exc}")
+            log.warning(_evt("no_pairs",
+                             combination_dir=str(config.COMBINATION_DIR),
+                             retry_in_s=60))
             continue
 
         with open(fname) as f:
@@ -72,10 +106,10 @@ def load_pairs() -> list[tuple[str, str, str]]:
                 if symbol:
                     pairs.append((spot_exch, fut_exch, symbol))
 
-    log.info(
-        f"Loaded {len(pairs)} pairs from {len(files)} combination files "
-        f"in {config.COMBINATION_DIR}"
-    )
+    log.info(_evt("pairs_loaded",
+                  pairs=len(pairs),
+                  files=len(files),
+                  combination_dir=str(config.COMBINATION_DIR)))
     return pairs
 
 
@@ -87,7 +121,7 @@ async def ensure_signal_csv():
     if not os.path.exists(csv_path) or os.path.getsize(csv_path) == 0:
         async with aiofiles.open(csv_path, "w") as f:
             await f.write(config.SIGNAL_CSV_HEADER + "\n")
-        log.info(f"Created {csv_path} with header")
+        log.info(_evt("csv_created", path=str(csv_path)))
 
 
 # ── Handle signal ──────────────────────────────────────────────────────────
@@ -102,6 +136,8 @@ async def handle_signal(
     bid_fut: float,
     spread_pct: float,
     ts_ms: int,
+    ts_spot: int,
+    ts_fut: int,
 ):
     cooldown_key = f"spread:cooldown:{spot_exch}:{fut_exch}:{symbol}"
 
@@ -114,6 +150,9 @@ async def handle_signal(
         f"{spot_exch},{fut_exch},{symbol},"
         f"{ask_spot:.8f},{bid_fut:.8f},{spread_pct:.4f},{ts_ms}"
     )
+
+    now_ms = int(time.time() * 1000)
+    t_emit_start = time.monotonic()
 
     # Write to CSV
     async with write_lock:
@@ -128,11 +167,17 @@ async def handle_signal(
         approximate=True,
     )
 
-    log.info(
-        f"SIGNAL | {spot_exch}→{fut_exch} {symbol} "
-        f"ask_spot={ask_spot:.4f} bid_fut={bid_fut:.4f} "
-        f"spread={spread_pct:.4f}%"
-    )
+    emit_lat_ms = (time.monotonic() - t_emit_start) * 1000
+
+    log.info(_evt("signal",
+                  spot_exchange=spot_exch, fut_exchange=fut_exch, symbol=symbol,
+                  ask_spot=float(ask_spot), bid_fut=float(bid_fut),
+                  spread_pct=round(spread_pct, 4),
+                  data_age_spot_ms=int(now_ms - ts_spot),
+                  data_age_fut_ms=int(now_ms - ts_fut),
+                  cooldown_applied=False,
+                  emit_lat_ms=round(emit_lat_ms, 1)))
+    _summary["signals"] += 1
 
 
 # ── Main monitor loop ──────────────────────────────────────────────────────
@@ -140,17 +185,15 @@ async def handle_signal(
 async def monitor_loop(redis: aioredis.Redis, pairs: list):
     write_lock = asyncio.Lock()
 
-    log.info(
-        f"Spread monitor loop started | "
-        f"pairs={len(pairs)} "
-        f"threshold={config.SPREAD_THRESHOLD}% "
-        f"interval={config.SPREAD_POLL_INTERVAL_MS}ms "
-        f"stale_ms={config.SPREAD_DATA_STALE_MS}ms"
-    )
+    log.info(_evt("spread_monitor_start",
+                  pairs=len(pairs),
+                  threshold_pct=config.SPREAD_THRESHOLD,
+                  poll_interval_ms=config.SPREAD_POLL_INTERVAL_MS,
+                  stale_threshold_ms=config.SPREAD_DATA_STALE_MS))
 
     while True:
-        t_cycle_start = time.monotonic()
-        now_ms        = int(time.time() * 1000)
+        t_cycle = time.monotonic()
+        now_ms  = int(time.time() * 1000)
 
         # Single pipeline: 2 HMGET per pair
         pipe = redis.pipeline(transaction=False)
@@ -159,16 +202,21 @@ async def monitor_loop(redis: aioredis.Redis, pairs: list):
             pipe.hmget(f"md:{fut_exch}:futures:{symbol}", "b", "ts")
 
         try:
+            t_pipe_start = time.monotonic()
             results = await pipe.execute()
+            pipeline_lat_ms = (time.monotonic() - t_pipe_start) * 1000
         except Exception as exc:
-            log.error(f"Redis pipeline error: {exc}")
+            log.error(_evt("redis_error",
+                           error_type=type(exc).__name__, error_msg=str(exc)))
             await asyncio.sleep(config.SPREAD_POLL_INTERVAL_MS / 1000)
             continue
 
         # Process results
+        t_calc_start   = time.monotonic()
         signals_count  = 0
         stale_count    = 0
         no_data_count  = 0
+        pairs_ok       = 0
 
         tasks = []
 
@@ -187,6 +235,7 @@ async def monitor_loop(redis: aioredis.Redis, pairs: list):
                 stale_count += 1
                 continue
 
+            pairs_ok += 1
             ask_spot = float(ask_data[0])
             bid_fut  = float(bid_data[0])
             if ask_spot <= 0:
@@ -202,6 +251,7 @@ async def monitor_loop(redis: aioredis.Redis, pairs: list):
                         redis, write_lock,
                         spot_exch, fut_exch, symbol,
                         ask_spot, bid_fut, spread_pct, now_ms,
+                        ask_ts, bid_ts,
                     )
                 )
                 tasks.append(task)
@@ -210,15 +260,53 @@ async def monitor_loop(redis: aioredis.Redis, pairs: list):
         if tasks:
             await asyncio.gather(*tasks, return_exceptions=True)
 
-        elapsed_ms = (time.monotonic() - t_cycle_start) * 1000
-        log.debug(
-            f"Cycle: {elapsed_ms:.1f}ms | "
-            f"pairs={len(pairs)} no_data={no_data_count} "
-            f"stale={stale_count} signals={signals_count}"
-        )
+        calc_lat_ms = (time.monotonic() - t_calc_start) * 1000
+        elapsed_ms  = (time.monotonic() - t_cycle) * 1000
+
+        # Accumulate summary
+        _summary["cycles"] += 1
+        _summary["cycle_lat_sum"] += elapsed_ms
+        if elapsed_ms > _summary["cycle_lat_max"]:
+            _summary["cycle_lat_max"] = elapsed_ms
+        _summary["cycle_lats"].append(elapsed_ms)
+        _summary["no_data_sum"] += no_data_count
+        _summary["stale_sum"] += stale_count
+
+        log.debug(_evt("cycle",
+                       pairs_total=len(pairs), pairs_ok=pairs_ok,
+                       pairs_no_data=no_data_count, pairs_stale=stale_count,
+                       signals=signals_count,
+                       cycle_lat_ms=round(elapsed_ms, 1),
+                       pipeline_lat_ms=round(pipeline_lat_ms, 1),
+                       calc_lat_ms=round(calc_lat_ms, 1)))
 
         if elapsed_ms > 250:
-            log.warning(f"Cycle slow: {elapsed_ms:.1f}ms > 250ms threshold")
+            _summary["slow_cycles"] += 1
+            log.warning(_evt("cycle_slow",
+                             cycle_lat_ms=round(elapsed_ms, 1), threshold_ms=250.0,
+                             pipeline_lat_ms=round(pipeline_lat_ms, 1),
+                             calc_lat_ms=round(calc_lat_ms, 1)))
+
+        # Periodic summary every 30s
+        if _summary["_last_summary_ts"] == 0.0:
+            _summary["_last_summary_ts"] = time.monotonic()
+        elif time.monotonic() - _summary["_last_summary_ts"] >= _SUMMARY_INTERVAL:
+            c = max(_summary["cycles"], 1)
+            log.info(_evt("spread_summary",
+                          interval_s=round(time.monotonic() - _summary["_last_summary_ts"], 1),
+                          cycles=_summary["cycles"],
+                          cycle_lat_avg_ms=round(_summary["cycle_lat_sum"] / c, 1),
+                          cycle_lat_max_ms=round(_summary["cycle_lat_max"], 1),
+                          cycle_lat_p99_ms=_p99(_summary["cycle_lats"]),
+                          slow_cycles=_summary["slow_cycles"],
+                          signals_total=_summary["signals"],
+                          pairs_no_data_avg=round(_summary["no_data_sum"] / c, 1),
+                          pairs_stale_avg=round(_summary["stale_sum"] / c, 1)))
+            # reset
+            _summary.update({"cycles": 0, "cycle_lat_sum": 0.0, "cycle_lat_max": 0.0,
+                              "cycle_lats": [], "slow_cycles": 0, "signals": 0,
+                              "no_data_sum": 0, "stale_sum": 0,
+                              "_last_summary_ts": time.monotonic()})
 
         sleep_ms = max(0, config.SPREAD_POLL_INTERVAL_MS - elapsed_ms)
         await asyncio.sleep(sleep_ms / 1000)
@@ -227,15 +315,16 @@ async def monitor_loop(redis: aioredis.Redis, pairs: list):
 async def main():
     pairs = load_pairs()
     if not pairs:
-        log.warning(
-            "No pairs loaded. "
-            "Run dictionaries/main.py first to generate combination files."
-        )
+        log.warning(_evt("no_pairs",
+                         combination_dir=str(config.COMBINATION_DIR),
+                         retry_in_s=60))
         # Don't exit — wait in case files appear later
         await asyncio.sleep(60)
         pairs = load_pairs()
         if not pairs:
-            log.error("Still no pairs after retry. Exiting.")
+            log.error(_evt("no_pairs",
+                           combination_dir=str(config.COMBINATION_DIR),
+                           retry_in_s=0))
             return
 
     await ensure_signal_csv()
@@ -244,7 +333,7 @@ async def main():
     try:
         await monitor_loop(redis, pairs)
     except KeyboardInterrupt:
-        log.info("spread_monitor stopped")
+        log.info(_evt("spread_monitor_stop", reason="KeyboardInterrupt"))
     finally:
         await redis.aclose()
 

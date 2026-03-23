@@ -170,3 +170,25 @@ class TestSignalCsv:
 
         content = csv_path.read_text()
         assert "existing_row" in content
+
+
+class TestSpreadMonitorEvents:
+    def test_evt_produces_valid_json(self):
+        import json
+        from monitors.spread_monitor import _evt
+        evt = _evt("signal", spot_exchange="binance", fut_exchange="bybit",
+                   symbol="BTCUSDT", spread_pct=1.5)
+        obj = json.loads(json.dumps(evt))
+        assert obj["event"] == "signal"
+        assert obj["component"] == "spread_monitor"
+        assert "ts" in obj
+
+    def test_p99_of_single_value(self):
+        from monitors.spread_monitor import _p99
+        assert _p99([42.0]) == 42.0
+
+    def test_p99_of_multiple_values(self):
+        from monitors.spread_monitor import _p99
+        values = list(range(1, 101))  # 1..100
+        result = _p99(values)
+        assert 98.0 <= result <= 100.0
