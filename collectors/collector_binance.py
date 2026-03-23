@@ -186,6 +186,7 @@ flush_event         = None  # set in main()
 expire_set:   set   = set()
 last_chunk_id: int  = 0
 ob_hist_last_ts: dict = {}  # hist_key → last write ts_ms (OB 10 Hz gate)
+buffer_write_ts: dict[str, float] = {}  # key → time.monotonic() when first written
 
 stats: dict = {
     "md_msgs": 0, "ob_msgs": 0, "fr_msgs": 0,
@@ -221,6 +222,8 @@ def write_md_to_buffer(symbol: str, bid: str, ask: str, ts_ms: int, market: str)
     global cmd_counter
     key = f"md:binance:{market}:{symbol}"
     batch_buffer[key] = {"b": bid, "a": ask, "ts": str(ts_ms)}
+    if key not in buffer_write_ts:
+        buffer_write_ts[key] = time.monotonic()
     cmd_counter += 1
 
     if config.HISTORY_ENABLED:
@@ -240,6 +243,8 @@ def write_ob_to_buffer(symbol: str, bids: list, asks: list, ts_ms: int, market: 
         fields[f"a{i}"]  = price
         fields[f"a{i}q"] = qty
     batch_buffer[key] = fields
+    if key not in buffer_write_ts:
+        buffer_write_ts[key] = time.monotonic()
     cmd_counter += 1
 
     if config.HISTORY_ENABLED:
@@ -260,6 +265,8 @@ def write_fr_to_buffer(symbol: str, rate: str, fr_ts_ms: str):
     key    = f"fr:binance:futures:{symbol}"
     ts_ms  = int(time.time() * 1000)
     batch_buffer[key] = {"fr": rate, "fr_ts": fr_ts_ms}
+    if key not in buffer_write_ts:
+        buffer_write_ts[key] = time.monotonic()
     cmd_counter += 1
 
     if config.HISTORY_ENABLED:
@@ -402,6 +409,15 @@ async def task_flusher(redis: aioredis.Redis):
         current_batch = batch_buffer.copy()
         batch_buffer.clear()
         cmd_counter = 0
+
+        # measure age of oldest pending entry before flushing
+        if buffer_write_ts:
+            oldest_write = min(buffer_write_ts.values())
+            age_ms = (time.monotonic() - oldest_write) * 1000
+            stats["buffer_age_sum"] += age_ms
+            if age_ms > stats["buffer_age_max"]:
+                stats["buffer_age_max"] = age_ms
+        buffer_write_ts.clear()
 
         t_start = time.monotonic()
         pipe = redis.pipeline(transaction=False)
