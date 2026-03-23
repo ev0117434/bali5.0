@@ -258,7 +258,6 @@ def parse_fr(raw: str):
 
 batch_buffer: dict = {}
 hist_buffer:  list = []
-cmd_counter:  int  = 0
 flush_event         = None
 expire_set:   set  = set()
 last_chunk_id: int = 0
@@ -287,12 +286,10 @@ stats: dict = {
 
 
 def write_md_to_buffer(symbol: str, bid: str, ask: str, ts_ms: int, market: str):
-    global cmd_counter
     key = f"md:gate:{market}:{symbol}"
     batch_buffer[key] = {"b": bid, "a": ask, "ts": str(ts_ms)}
     if key not in buffer_write_ts:
         buffer_write_ts[key] = time.monotonic()
-    cmd_counter += 1
 
     if config.HISTORY_ENABLED:
         chunk_id = int(ts_ms / 1000 / config.CHUNK_DURATION)
@@ -301,7 +298,6 @@ def write_md_to_buffer(symbol: str, bid: str, ask: str, ts_ms: int, market: str)
 
 
 def write_ob_to_buffer(symbol: str, bids: list, asks: list, ts_ms: int, market: str):
-    global cmd_counter
     key    = f"ob:gate:{market}:{symbol}"
     fields = {}
     for i, (price, qty) in enumerate(bids[:10], 1):
@@ -313,7 +309,6 @@ def write_ob_to_buffer(symbol: str, bids: list, asks: list, ts_ms: int, market: 
     batch_buffer[key] = fields
     if key not in buffer_write_ts:
         buffer_write_ts[key] = time.monotonic()
-    cmd_counter += 1
 
     if config.HISTORY_ENABLED:
         chunk_id = int(ts_ms / 1000 / config.CHUNK_DURATION)
@@ -329,14 +324,12 @@ def write_ob_to_buffer(symbol: str, bids: list, asks: list, ts_ms: int, market: 
 
 
 def write_fr_to_buffer(symbol: str, rate: str, fr_ts_ms: str):
-    global cmd_counter
     key   = f"fr:gate:futures:{symbol}"
     ts_ms = int(time.time() * 1000)
     # Always write fr_ts (even ""); Gate messages are full snapshots, no delta pattern.
     batch_buffer[key] = {"fr": rate, "fr_ts": fr_ts_ms}
     if key not in buffer_write_ts:
         buffer_write_ts[key] = time.monotonic()
-    cmd_counter += 1
 
     if config.HISTORY_ENABLED:
         chunk_id = int(ts_ms / 1000 / config.CHUNK_DURATION)
@@ -352,7 +345,6 @@ async def _ws_task(url: str, label: str, subscribe_fn, parse_fn, write_fn,
     Connect to url, call subscribe_fn(ws) to subscribe,
     then parse/write in a loop.
     """
-    global cmd_counter
     backoff = config.WS_RECONNECT_INIT
 
     while True:
@@ -375,8 +367,6 @@ async def _ws_task(url: str, label: str, subscribe_fn, parse_fn, write_fn,
                     if result is not None:
                         write_fn(*result, market=market)
                         stats[stat_key] += 1
-                    if cmd_counter >= config.BATCH_MAX_COMMANDS:
-                        flush_event.set()
 
         except asyncio.CancelledError:
             raise
@@ -431,7 +421,6 @@ async def task_ob_spot(native_spot: list[str]):
     spot.order_book: subscribe one symbol at a time.
     Use chunked sends to avoid flooding.
     """
-    global cmd_counter
     backoff = config.WS_RECONNECT_INIT
 
     while True:
@@ -464,8 +453,6 @@ async def task_ob_spot(native_spot: list[str]):
                     if result is not None:
                         write_ob_to_buffer(*result, market="spot")
                         stats["ob_msgs"] += 1
-                    if cmd_counter >= config.BATCH_MAX_COMMANDS:
-                        flush_event.set()
 
         except asyncio.CancelledError:
             raise
@@ -512,7 +499,6 @@ async def task_fr(native_fut: list[str]):
             }
             await ws.send(json.dumps(msg))
 
-    global cmd_counter
     backoff = config.WS_RECONNECT_INIT
 
     while True:
@@ -535,8 +521,6 @@ async def task_fr(native_fut: list[str]):
                     if result is not None:
                         write_fr_to_buffer(*result)
                         stats["fr_msgs"] += 1
-                    if cmd_counter >= config.BATCH_MAX_COMMANDS:
-                        flush_event.set()
 
         except asyncio.CancelledError:
             raise
@@ -553,7 +537,6 @@ async def task_fr(native_fut: list[str]):
 # ── Flusher (primary: hset only) ───────────────────────────────────────────
 
 async def task_flusher(redis: aioredis.Redis):
-    global cmd_counter
 
     while True:
         try:
@@ -570,7 +553,6 @@ async def task_flusher(redis: aioredis.Redis):
 
         current_batch = batch_buffer.copy()
         batch_buffer.clear()
-        cmd_counter = 0
 
         # measure age of oldest pending entry before flushing
         if buffer_write_ts:

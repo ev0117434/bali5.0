@@ -180,7 +180,6 @@ def parse_ob(raw: str):
 
 batch_buffer: dict = {}
 hist_buffer:  list = []
-cmd_counter:  int  = 0
 flush_event         = None
 expire_set:   set  = set()
 last_chunk_id: int = 0
@@ -211,12 +210,10 @@ stats: dict = {
 
 
 def write_md_to_buffer(symbol: str, bid: str, ask: str, ts_ms: int, market: str):
-    global cmd_counter
     key = f"md:bitget:{market}:{symbol}"
     batch_buffer[key] = {"b": bid, "a": ask, "ts": str(ts_ms)}
     if key not in buffer_write_ts:
         buffer_write_ts[key] = time.monotonic()
-    cmd_counter += 1
 
     if config.HISTORY_ENABLED:
         chunk_id = int(ts_ms / 1000 / config.CHUNK_DURATION)
@@ -225,7 +222,6 @@ def write_md_to_buffer(symbol: str, bid: str, ask: str, ts_ms: int, market: str)
 
 
 def write_ob_to_buffer(symbol: str, bids: list, asks: list, ts_ms: int, market: str):
-    global cmd_counter
     key    = f"ob:bitget:{market}:{symbol}"
     fields = {}
     for i, (price, qty) in enumerate(bids[:10], 1):
@@ -237,7 +233,6 @@ def write_ob_to_buffer(symbol: str, bids: list, asks: list, ts_ms: int, market: 
     batch_buffer[key] = fields
     if key not in buffer_write_ts:
         buffer_write_ts[key] = time.monotonic()
-    cmd_counter += 1
 
     if config.HISTORY_ENABLED:
         # Accumulate full book state (mirrors hset semantics: delta overwrites changed levels)
@@ -276,13 +271,11 @@ def write_ob_to_buffer(symbol: str, bids: list, asks: list, ts_ms: int, market: 
 
 
 def write_fr_to_buffer(symbol: str, rate: str, fr_ts_ms: str):
-    global cmd_counter
     key   = f"fr:bitget:futures:{symbol}"
     ts_ms = int(time.time() * 1000)
     batch_buffer[key] = {"fr": rate, "fr_ts": fr_ts_ms}
     if key not in buffer_write_ts:
         buffer_write_ts[key] = time.monotonic()
-    cmd_counter += 1
 
     if config.HISTORY_ENABLED:
         chunk_id = int(ts_ms / 1000 / config.CHUNK_DURATION)
@@ -306,7 +299,6 @@ async def _heartbeat(ws, label: str):
 
 async def _ws_task(label: str, args_list: list[dict], parse_fn, write_fn,
                    market: str, stat_key: str, also_parse_fr: bool = False):
-    global cmd_counter
     backoff = config.WS_RECONNECT_INIT
     chunk_size = config.WS_CHUNK_BITGET
 
@@ -343,8 +335,6 @@ async def _ws_task(label: str, args_list: list[dict], parse_fn, write_fn,
                                 write_fr_to_buffer(*fr_result)
                                 stats["fr_msgs"] += 1
 
-                        if cmd_counter >= config.BATCH_MAX_COMMANDS:
-                            flush_event.set()
                 finally:
                     hb_task.cancel()
 
@@ -392,7 +382,6 @@ async def task_ob_fut(symbols: list[str]):
 # ── Flusher (primary: hset only) ───────────────────────────────────────────
 
 async def task_flusher(redis: aioredis.Redis):
-    global cmd_counter
 
     while True:
         try:
@@ -409,7 +398,6 @@ async def task_flusher(redis: aioredis.Redis):
 
         current_batch = batch_buffer.copy()
         batch_buffer.clear()
-        cmd_counter = 0
 
         # measure age of oldest pending entry before flushing
         if buffer_write_ts:

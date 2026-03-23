@@ -186,7 +186,6 @@ def parse_fr(raw: str):
 
 batch_buffer: dict = {}
 hist_buffer:  list = []
-cmd_counter:  int  = 0
 flush_event         = None
 expire_set:   set  = set()
 last_chunk_id: int = 0
@@ -219,12 +218,10 @@ stats: dict = {
 
 
 def write_md_to_buffer(symbol: str, bid: str, ask: str, ts_ms: int, market: str):
-    global cmd_counter
     key = f"md:okx:{market}:{symbol}"
     batch_buffer[key] = {"b": bid, "a": ask, "ts": str(ts_ms)}
     if key not in buffer_write_ts:
         buffer_write_ts[key] = time.monotonic()
-    cmd_counter += 1
 
     if config.HISTORY_ENABLED:
         chunk_id = int(ts_ms / 1000 / config.CHUNK_DURATION)
@@ -249,7 +246,6 @@ def _merge_ob_book(book_side: dict, levels: list, descending: bool) -> dict:
 
 def write_ob_to_buffer(action: str, symbol: str, bids: list, asks: list,
                        ts_ms: int, market: str):
-    global cmd_counter
     book_key = f"{market}:{symbol}"
 
     if action == "snapshot":
@@ -282,7 +278,6 @@ def write_ob_to_buffer(action: str, symbol: str, bids: list, asks: list,
     batch_buffer[key] = fields
     if key not in buffer_write_ts:
         buffer_write_ts[key] = time.monotonic()
-    cmd_counter += 1
 
     if config.HISTORY_ENABLED:
         chunk_id = int(ts_ms / 1000 / config.CHUNK_DURATION)
@@ -298,13 +293,11 @@ def write_ob_to_buffer(action: str, symbol: str, bids: list, asks: list,
 
 
 def write_fr_to_buffer(symbol: str, rate: str, fr_ts_ms: str):
-    global cmd_counter
     key   = f"fr:okx:futures:{symbol}"
     ts_ms = int(time.time() * 1000)
     batch_buffer[key] = {"fr": rate, "fr_ts": fr_ts_ms}
     if key not in buffer_write_ts:
         buffer_write_ts[key] = time.monotonic()
-    cmd_counter += 1
 
     if config.HISTORY_ENABLED:
         chunk_id = int(ts_ms / 1000 / config.CHUNK_DURATION)
@@ -333,7 +326,6 @@ async def _ws_channel_task(label: str, args_list: list[dict], parse_fn, write_fn
     parse_fn returns (symbol, ...) or None.
     write_fn(*result, market=market).
     """
-    global cmd_counter
     backoff = config.WS_RECONNECT_INIT
 
     while True:
@@ -365,8 +357,6 @@ async def _ws_channel_task(label: str, args_list: list[dict], parse_fn, write_fn
                             write_fn(*result, market=market)
                             stats[stat_key] += 1
 
-                        if cmd_counter >= config.BATCH_MAX_COMMANDS:
-                            flush_event.set()
                 finally:
                     hb_task.cancel()
 
@@ -400,7 +390,6 @@ async def _task_ob(label: str, native_list: list[str], market: str):
     Cannot use _ws_channel_task because parse_ob now returns 5 elements
     (action, symbol, bids, asks, ts_ms) and write_ob_to_buffer needs action.
     """
-    global cmd_counter
     backoff = config.WS_RECONNECT_INIT
     args = [{"channel": "books", "instId": n} for n in native_list]
 
@@ -436,8 +425,6 @@ async def _task_ob(label: str, native_list: list[str], market: str):
                             action, symbol, bids, asks, ts_ms = result
                             write_ob_to_buffer(action, symbol, bids, asks, ts_ms, market=market)
                             stats["ob_msgs"] += 1
-                        if cmd_counter >= config.BATCH_MAX_COMMANDS:
-                            flush_event.set()
                 finally:
                     hb_task.cancel()
 
@@ -463,7 +450,6 @@ async def task_ob_fut(native_fut_list: list[str]):
 
 async def task_fr(native_fut_list: list[str]):
     """FR via funding-rate channel — parse_fn handles the write directly."""
-    global cmd_counter
     backoff = config.WS_RECONNECT_INIT
 
     args = [{"channel": "funding-rate", "instId": n} for n in native_fut_list]
@@ -495,8 +481,6 @@ async def task_fr(native_fut_list: list[str]):
                         if result is not None:
                             write_fr_to_buffer(*result)
                             stats["fr_msgs"] += 1
-                        if cmd_counter >= config.BATCH_MAX_COMMANDS:
-                            flush_event.set()
                 finally:
                     hb_task.cancel()
 
@@ -515,7 +499,6 @@ async def task_fr(native_fut_list: list[str]):
 # ── Flusher (primary: hset only) ───────────────────────────────────────────
 
 async def task_flusher(redis: aioredis.Redis):
-    global cmd_counter
 
     while True:
         try:
@@ -532,7 +515,6 @@ async def task_flusher(redis: aioredis.Redis):
 
         current_batch = batch_buffer.copy()
         batch_buffer.clear()
-        cmd_counter = 0
 
         # measure age of oldest pending entry before flushing
         if buffer_write_ts:

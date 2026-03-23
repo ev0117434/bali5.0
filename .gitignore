@@ -15,8 +15,14 @@ signal/snapshot/
 # Redis unix socket (runtime file — not committed)
 redis.sock
 
+# Analysis output
+problems/
+
 # IDE
 .idea/
 .vscode/
 *.egg-info/
 .claude/
+
+# Superpowers sessions
+.superpowers/

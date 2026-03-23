@@ -181,7 +181,6 @@ def parse_fr(raw: str):
 
 batch_buffer: dict  = {}    # key → {field: value}
 hist_buffer:  list  = []    # [(hist_key, line_str), ...]
-cmd_counter:  int   = 0
 flush_event         = None  # set in main()
 expire_set:   set   = set()
 last_chunk_id: int  = 0
@@ -219,12 +218,10 @@ def _evt(event: str, **kwargs) -> dict:
 # ── Buffer writers ─────────────────────────────────────────────────────────
 
 def write_md_to_buffer(symbol: str, bid: str, ask: str, ts_ms: int, market: str):
-    global cmd_counter
     key = f"md:binance:{market}:{symbol}"
     batch_buffer[key] = {"b": bid, "a": ask, "ts": str(ts_ms)}
     if key not in buffer_write_ts:
         buffer_write_ts[key] = time.monotonic()
-    cmd_counter += 1
 
     if config.HISTORY_ENABLED:
         chunk_id = int(ts_ms / 1000 / config.CHUNK_DURATION)
@@ -233,7 +230,6 @@ def write_md_to_buffer(symbol: str, bid: str, ask: str, ts_ms: int, market: str)
 
 
 def write_ob_to_buffer(symbol: str, bids: list, asks: list, ts_ms: int, market: str):
-    global cmd_counter
     key    = f"ob:binance:{market}:{symbol}"
     fields = {}
     for i, (price, qty) in enumerate(bids[:10], 1):
@@ -245,7 +241,6 @@ def write_ob_to_buffer(symbol: str, bids: list, asks: list, ts_ms: int, market: 
     batch_buffer[key] = fields
     if key not in buffer_write_ts:
         buffer_write_ts[key] = time.monotonic()
-    cmd_counter += 1
 
     if config.HISTORY_ENABLED:
         chunk_id = int(ts_ms / 1000 / config.CHUNK_DURATION)
@@ -261,13 +256,11 @@ def write_ob_to_buffer(symbol: str, bids: list, asks: list, ts_ms: int, market: 
 
 
 def write_fr_to_buffer(symbol: str, rate: str, fr_ts_ms: str):
-    global cmd_counter
     key    = f"fr:binance:futures:{symbol}"
     ts_ms  = int(time.time() * 1000)
     batch_buffer[key] = {"fr": rate, "fr_ts": fr_ts_ms}
     if key not in buffer_write_ts:
         buffer_write_ts[key] = time.monotonic()
-    cmd_counter += 1
 
     if config.HISTORY_ENABLED:
         chunk_id = int(ts_ms / 1000 / config.CHUNK_DURATION)
@@ -283,7 +276,6 @@ async def _ws_recv_loop(url: str, parser, label: str, symbols: list = None):
     parser returns None / single result / list of results.
     Each result is passed to the appropriate buffer writer via label.
     """
-    global cmd_counter
     backoff = config.WS_RECONNECT_INIT
 
     while True:
@@ -323,8 +315,6 @@ async def _ws_recv_loop(url: str, parser, label: str, symbols: list = None):
                             write_fr_to_buffer(*item)
                         stats["fr_msgs"] += len(result)
 
-                    if cmd_counter >= config.BATCH_MAX_COMMANDS:
-                        flush_event.set()
 
         except asyncio.CancelledError:
             raise
@@ -391,13 +381,12 @@ async def task_fr():
 # ── Flusher (primary: hset only) ───────────────────────────────────────────
 
 async def task_flusher(redis: aioredis.Redis):
-    global cmd_counter
 
     while True:
         try:
             await asyncio.wait_for(
                 flush_event.wait(),
-                timeout=config.BATCH_FLUSH_INTERVAL_MS / 1000,
+                timeout=config.BINANCE_BATCH_FLUSH_INTERVAL_MS / 1000,
             )
         except asyncio.TimeoutError:
             pass
@@ -408,7 +397,6 @@ async def task_flusher(redis: aioredis.Redis):
 
         current_batch = batch_buffer.copy()
         batch_buffer.clear()
-        cmd_counter = 0
 
         # measure age of oldest pending entry before flushing
         if buffer_write_ts:

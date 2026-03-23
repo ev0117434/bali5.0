@@ -67,7 +67,7 @@ def parse_md(msg: dict) -> tuple:
     return symbol, bid, ask, ts
 ```
 
-**OB (depth10@100ms):**
+**OB spot (depth10@100ms):**
 ```json
 {
   "stream": "btcusdt@depth10@100ms",
@@ -79,9 +79,10 @@ def parse_md(msg: dict) -> tuple:
 }
 ```
 ```python
-def parse_ob(msg: dict) -> tuple:
+def parse_ob(raw: str) -> tuple | None:
+    msg  = json.loads(raw)
     data = msg.get("data", msg)
-    # stream name: "btcusdt@depth10@100ms"
+    if "bids" not in data: return None
     stream = msg.get("stream", "")
     symbol = stream.split("@")[0].upper()
     bids = data["bids"][:10]   # уже отсортированы лучшая цена первой
@@ -89,6 +90,37 @@ def parse_ob(msg: dict) -> tuple:
     ts = int(time.time() * 1000)
     return symbol, bids, asks, ts
 ```
+
+**OB futures (depth10@100ms) — формат отличается от spot!**
+```json
+{
+  "stream": "btcusdt@depth10@100ms",
+  "data": {
+    "e": "depthUpdate",
+    "E": 1700000000000,
+    "T": 1700000000000,
+    "s": "BTCUSDT",
+    "b": [["34000.10", "10.50"], ...],
+    "a": [["34001.50", "8.30"], ...]
+  }
+}
+```
+```python
+def parse_ob_fut(raw: str) -> tuple | None:
+    """Futures depth — использует b/a (не bids/asks) + e="depthUpdate"."""
+    msg  = json.loads(raw)
+    data = msg.get("data", msg)
+    if data.get("e") != "depthUpdate": return None
+    stream = msg.get("stream", "")
+    symbol = stream.split("@")[0].upper() if stream else data.get("s", "")
+    bids = data.get("b", [])[:10]
+    asks = data.get("a", [])[:10]
+    ts   = int(time.time() * 1000)
+    return symbol, bids, asks, ts
+```
+
+> ⚠️ **ВАЖНО**: Binance futures depth WS использует `"b"`/`"a"` (не `"bids"`/`"asks"`) и имеет поле `"e": "depthUpdate"`.
+> Spot и futures — разные парсеры: `parse_ob` для spot, `parse_ob_fut` для futures.
 
 **FR (markPrice futures):**
 ```json
@@ -215,10 +247,18 @@ def parse_fr_from_ticker(msg: dict) -> tuple | None:
     data = msg.get("data", {})
     fr = data.get("fundingRate")
     fr_ts = data.get("nextFundingTime")
-    if not fr or not fr_ts: return None
+    if not fr: return None
     symbol = data["symbol"]
-    return symbol, fr, str(fr_ts)
+    return symbol, fr, str(fr_ts) if fr_ts else ""
 ```
+
+> ⚠️ **ВАЖНО**: Bybit tickers stream — snapshot+delta паттерн.
+> `nextFundingTime` присутствует только в `type: "snapshot"` (первое сообщение).
+> В `type: "delta"` поле **отсутствует**, если время следующего фандинга не изменилось.
+> Парсер возвращает `fr_ts = ""` для delta-сообщений без `nextFundingTime`.
+> `write_fr_to_buffer` НЕ включает `fr_ts` в mapping если он пустой — `hset` с частичным
+> mapping не удаляет существующие поля в Redis, что позволяет сохранить последнее
+> валидное значение из snapshot.
 
 **OB (orderbook.10):**
 ```json
@@ -470,13 +510,15 @@ subscribe_msg = {
 }
 # ВАЖНО: spot.order_book принимает ОДИН символ за раз!
 
-# OB futures:
+# OB futures (full snapshot, НЕ инкрементальные дельты):
 {
-    "channel": "futures.order_book_update",
+    "channel": "futures.order_book",
     "event": "subscribe",
     "payload": ["BTC_USDT", "100ms", "10"]
     # последний параметр: количество уровней
 }
+# ⚠️ futures.order_book_update (дельты) НЕ используем:
+#    batch_buffer сохраняет только последнее обновление → при пустых дельтах стакан теряется
 
 # FR futures:
 {
@@ -547,6 +589,33 @@ def parse_md_spot(msg: dict) -> tuple | None:
 }
 ```
 
+**OB futures (futures.order_book snapshot):**
+```json
+{
+  "channel": "futures.order_book",
+  "event": "all",
+  "result": {
+    "t": 1705312345123,
+    "contract": "BTC_USDT",
+    "bids": [{"p": "34000.10", "s": "10.50"}, ...],
+    "asks": [{"p": "34001.50", "s": "8.30"}, ...]
+  }
+}
+```
+```python
+def parse_ob_fut(raw: str) -> tuple | None:
+    msg    = json.loads(raw)
+    if msg.get("event") in ("subscribe", "unsubscribe", "update"): return None
+    result = msg.get("result")
+    if not result: return None
+    if msg.get("channel") != "futures.order_book": return None
+    symbol = normalize(result.get("contract", ""))
+    bids   = [[b["p"], b["s"]] for b in result.get("bids", [])[:10]]
+    asks   = [[a["p"], a["s"]] for a in result.get("asks", [])[:10]]
+    ts_ms  = int(result.get("t", int(time.time() * 1000)))
+    return symbol, bids, asks, ts_ms
+```
+
 **FR futures (futures.tickers):**
 ```json
 {
@@ -566,11 +635,16 @@ def parse_fr(msg: dict) -> tuple | None:
     r = results[0] if isinstance(results, list) else results
     symbol = normalize(r["contract"])
     rate = r.get("funding_rate", "")
-    # funding_next_apply — в СЕКУНДАХ (не мс!)
-    fr_ts_sec = r.get("funding_next_apply", 0)
-    fr_ts_ms = str(fr_ts_sec * 1000)  # конвертируем в мс
+    # Gate USDT-perp funds every 8h at 00:00/08:00/16:00 UTC.
+    # Always compute next boundary — funding_next_apply is unreliable (often 0).
+    now = int(time.time())
+    fr_ts_ms = str(((now // 28800) + 1) * 28800 * 1000)
     return symbol, rate, fr_ts_ms
 ```
+
+> Gate USDT-perp фундит строго каждые 8 часов: 00:00, 08:00, 16:00 UTC.
+> `funding_next_apply` ненадёжен (часто `0`) → всегда вычисляем следующую границу:
+> `((now // 28800) + 1) * 28800 * 1000`
 
 ### Heartbeat
 ```python
@@ -694,22 +768,75 @@ def parse_md(msg: dict) -> tuple | None:
 def parse_fr_from_ticker(msg: dict) -> tuple | None:
     d = msg.get("data", [{}])[0]
     fr = d.get("fundingRate")
-    fr_ts = d.get("nextSettleTime")
     if not fr: return None
-    return normalize(d["instId"]), fr, str(fr_ts)
+    symbol = d["instId"].upper()
+    fr_ts = d.get("nextSettleTime", "")
+    if fr_ts:
+        _fr_ts_cache[symbol] = str(fr_ts)
+        fr_ts_ms = str(fr_ts)
+    elif symbol in _fr_ts_cache:
+        fr_ts_ms = _fr_ts_cache[symbol]
+    else:
+        # Compute next 8h boundary (Bitget USDT-perp: 00:00/08:00/16:00 UTC)
+        now = int(time.time())
+        fr_ts_ms = str(((now // 28800) + 1) * 28800 * 1000)
+    return symbol, str(fr), fr_ts_ms
 ```
 
-**OB (books):**
+> `nextSettleTime` присутствует только в snapshot-сообщениях, дельты его не содержат.
+> Приоритет: значение из API → кэш предыдущего snapshot → вычисленная 8ч граница (fallback).
+
+**OB (books) — snapshot + delta протокол:**
 ```json
 {
   "action": "snapshot",
   "data": [{
-    "asks": [["34001.50", "5.20"], ...],
-    "bids": [["34000.10", "10.50"], ...],
+    "asks": [["34001.50", "5.20", "0", "0"], ...],
+    "bids": [["34000.10", "10.50", "0", "0"], ...],
     "ts": "1705312345123"
   }]
 }
 ```
+```json
+{
+  "action": "update",
+  "data": [{
+    "bids": [["34000.15", "8.20", "0", "0"]],
+    "asks": [],
+    "ts": "1705312345234"
+  }]
+}
+```
+
+> ⚠️ **ВАЖНО**: Bitget `books` использует snapshot+delta паттерн.
+> Первое сообщение (`action: "snapshot"`) содержит полный стакан (до 200 уровней).
+> Последующие (`action: "update"`) содержат **только изменившиеся уровни**, часто
+> с одной стороны (например 1 бид и 0 асков). qty=0 означает удаление уровня.
+
+```python
+def parse_ob(raw: str) -> tuple | None:
+    msg      = json.loads(raw)
+    data_list = msg.get("data", [])
+    if not data_list: return None
+    d      = data_list[0]
+    bids   = [[b[0], b[1]] for b in d.get("bids", [])[:10]]
+    asks   = [[a[0], a[1]] for a in d.get("asks", [])[:10]]
+    symbol = msg.get("arg", {}).get("instId", "").upper()
+    if not symbol or (not bids and not asks): return None
+    ts_ms  = int(d.get("ts", int(time.time() * 1000)))
+    return symbol, bids, asks, ts_ms
+```
+
+**OB hist — in-memory full state (важно!):**
+
+Из-за delta-формата `write_ob_to_buffer` поддерживает in-memory `ob_full_state`:
+каждый delta-апдейт применяется к нему (`state.update(fields)`), и hist-запись строится
+из полного состояния, а не из delta. Это гарантирует, что hist всегда содержит оба
+side (≥1 бид и ≥1 аск) и проходит валидацию.
+
+Запись в hist пропускается (`ob_hist_skipped`), если после применения delta
+`ob_full_state` всё ещё не содержит ни одного уровня на одной из сторон
+(возможно только до получения первого snapshot).
 
 ### Heartbeat
 ```python
@@ -742,10 +869,10 @@ def native(symbol: str) -> str: return symbol  # уже нормализован
 
 | Exchange | MD channel | OB channel | FR channel | Native format | Heartbeat |
 |----------|-----------|-----------|-----------|---------------|-----------|
-| Binance | bookTicker | depth10@100ms | markPrice | BTCUSDT | auto WS |
+| Binance | bookTicker | spot: depth10 (bids/asks) / fut: depth10 (depthUpdate b/a) | markPrice | BTCUSDT | auto WS |
 | Bybit | tickers.* | orderbook.10.* | tickers.* (linear) | BTCUSDT | ping json 20s |
 | OKX | bbo-tbt | books | funding-rate | BTC-USDT(-SWAP) | "ping" str 25s |
-| Gate.io | book_ticker | order_book | futures.tickers | BTC_USDT | auto WS |
+| Gate.io | book_ticker | spot: order_book / fut: order_book (snapshot) | futures.tickers | BTC_USDT | auto WS |
 | Bitget | ticker | books | ticker (futures) | BTCUSDT | "ping" str 25s |
 
 ---
@@ -755,11 +882,17 @@ def native(symbol: str) -> str: return symbol  # уже нормализован
 ### Binance
 - bookTicker НЕ содержит timestamp → используем `time.time() * 1000`
 - depth10@100ms даёт снепшот стакана, не diff
+- **Spot OB формат**: `{"bids": [...], "asks": [...]}` → парсер `parse_ob`
+- **Futures OB формат**: `{"e": "depthUpdate", "b": [...], "a": [...]}` → парсер `parse_ob_fut`
+  (разные ключи — разные парсеры!)
 
 ### Bybit
 - FR приходит ВМЕСТЕ с MD в tickers → одна подписка на linear ticker даёт и MD и FR
-- `type: "snapshot"` — первое сообщение, `type: "delta"` — обновления для OB
-- Для OB нужно обрабатывать оба типа
+- `type: "snapshot"` — первое сообщение со всеми полями; `type: "delta"` — только изменившиеся поля
+- `nextFundingTime` есть только в snapshot-сообщениях → delta-обновления возвращают `fr_ts = ""`
+- `write_fr_to_buffer` не включает `fr_ts` в mapping при пустом значении — Redis `hset` с
+  частичным mapping сохраняет предыдущее значение поля
+- Для OB нужно обрабатывать оба типа (snapshot + delta)
 
 ### OKX
 - books channel даёт `action: "snapshot"` и `action: "update"` (дельты)
@@ -770,8 +903,17 @@ def native(symbol: str) -> str: return symbol  # уже нормализован
 - ⚠️ **ТРЕБУЕТ УТОЧНЕНИЯ** — см. docs/07_open_questions.md
 
 ### Gate.io
-- `funding_next_apply` в **секундах**, не мс — конвертируем при парсинге
+- `fr_ts` всегда вычисляется как следующая 8ч граница (00:00/08:00/16:00 UTC); `funding_next_apply` игнорируется (ненадёжен)
 - spot.order_book требует отдельный subscribe на каждый символ
+- **Futures OB**: используем `futures.order_book` (полные снепшоты), НЕ `futures.order_book_update`
+  (инкрементальные дельты теряются из-за last-write-wins в batch_buffer)
 
 ### Bitget
 - Использовать `books` channel (не `books5`) и обрезать до 10 уровней
+- `books` channel работает по схеме **snapshot + delta**: первое сообщение — полный
+  стакан, последующие — только изменившиеся уровни (1-2 уровня, часто только одна сторона)
+- **OB hist использует `ob_full_state`**: per-key in-memory словарь, куда применяются
+  все дельты (`state.update(fields)` — зеркало Redis `hset`). Hist-запись строится из
+  полного состояния → всегда содержит оба side, проходит валидатор
+- Без этого 68% hist-записей имели бы формат `price,qty,ts` (3 значения) вместо
+  минимально необходимых 5 (1 бид + 1 аск + ts)

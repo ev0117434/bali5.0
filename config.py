@@ -18,9 +18,10 @@ REDIS_DB          = 0
 REDIS_URL         = f"unix://{REDIS_SOCKET_PATH}?db={REDIS_DB}"
 
 # ── Батчинг коллекторов ────────────────────────────────────────────────────
-BATCH_FLUSH_INTERVAL_MS = 250   # мс: макс время до следующего primary flush
-BATCH_MAX_COMMANDS      = 100   # кол-во primary Redis команд для принудительного flush
+BATCH_FLUSH_INTERVAL_MS         = 50   # мс: макс время до следующего primary flush
+BINANCE_BATCH_FLUSH_INTERVAL_MS = 100  # мс: Binance flush — 50ms даёт слишком много slow flushes
 HIST_FLUSH_INTERVAL_MS  = 300   # мс: интервал отдельного hist-flusher (lpush)
+HIST_FLUSH_CHUNK        = 5000  # макс команд в одном pipeline hist-flush (предотвращает ~37k-cmd спайки)
 OB_HIST_MIN_INTERVAL_MS = 100   # мс: мин интервал между hist-записями OB (10 Hz)
 
 # ── Параметры WebSocket ────────────────────────────────────────────────────
@@ -59,12 +60,14 @@ STALE_THRESHOLD_SECONDS = 360  # сек: ключ считается stale ес�
 STALE_CHECK_INTERVAL    = 30   # сек: как часто проверять
 
 # ── Redis Monitor ─────────────────────────────────────────────────────────
-REDIS_CHECK_INTERVAL    = 30   # сек
-REDIS_MEMORY_WARN_MB    = 3000 # MB: предупреждение если выше
-REDIS_OPS_WARN_PER_SEC  = 200000  # ops/sec: предупреждение если выше
+REDIS_CHECK_INTERVAL       = 30   # сек
+REDIS_MEMORY_WARN_MB       = 3000 # MB: предупреждение если выше
+REDIS_OPS_WARN_PER_SEC     = 200000  # ops/sec: предупреждение если выше
+REDIS_BLOCKED_WARN_THRESHOLD = 1  # snapshot_monitor всегда держит 1 blocked (XREAD block=2000)
+                                  # предупреждаем только если blocked > этого порога
 
 # ── Spread Monitor ────────────────────────────────────────────────────────
-SPREAD_POLL_INTERVAL_MS = 300  # мс: интервал сканирования
+SPREAD_POLL_INTERVAL_MS = 100  # мс: интервал сканирования
 SPREAD_THRESHOLD        = 1.00 # %: минимальный спред для сигнала
 COOLDOWN_SECONDS        = 3600 # сек: кулдаун после сигнала
 
@@ -73,7 +76,7 @@ SPREAD_DATA_STALE_MS    = 5000 # мс: данные старше 5 сек про
 
 # ── Snapshot Monitor ──────────────────────────────────────────────────────
 SNAPSHOT_DURATION       = 3500 # сек: длительность записи снапшота
-SNAPSHOT_INTERVAL_MS    = 300  # мс: интервал строки в снапшоте
+SNAPSHOT_INTERVAL_MS    = 100  # мс: интервал строки в снапшоте
 HISTORY_LOOKBACK_MS     = 3_600_000  # мс = 1 час истории до сигнала
 
 # ── Пути к файлам ─────────────────────────────────────────────────────────

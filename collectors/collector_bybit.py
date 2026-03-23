@@ -152,7 +152,6 @@ def parse_ob(raw: str):
 
 batch_buffer: dict = {}
 hist_buffer:  list = []
-cmd_counter:  int  = 0
 flush_event         = None
 expire_set:   set  = set()
 last_chunk_id: int = 0
@@ -182,12 +181,10 @@ stats: dict = {
 
 
 def write_md_to_buffer(symbol: str, bid: str, ask: str, ts_ms: int, market: str):
-    global cmd_counter
     key = f"md:bybit:{market}:{symbol}"
     batch_buffer[key] = {"b": bid, "a": ask, "ts": str(ts_ms)}
     if key not in buffer_write_ts:
         buffer_write_ts[key] = time.monotonic()
-    cmd_counter += 1
 
     if config.HISTORY_ENABLED:
         chunk_id = int(ts_ms / 1000 / config.CHUNK_DURATION)
@@ -196,7 +193,6 @@ def write_md_to_buffer(symbol: str, bid: str, ask: str, ts_ms: int, market: str)
 
 
 def write_ob_to_buffer(symbol: str, bids: list, asks: list, ts_ms: int, market: str):
-    global cmd_counter
     key    = f"ob:bybit:{market}:{symbol}"
     fields = {}
     for i, (price, qty) in enumerate(bids[:10], 1):
@@ -208,7 +204,6 @@ def write_ob_to_buffer(symbol: str, bids: list, asks: list, ts_ms: int, market: 
     batch_buffer[key] = fields
     if key not in buffer_write_ts:
         buffer_write_ts[key] = time.monotonic()
-    cmd_counter += 1
 
     if config.HISTORY_ENABLED and bids and asks:
         # Пропускаем дельты с пустой одной стороной (snapshot+delta паттерн Bybit):
@@ -227,7 +222,6 @@ def write_ob_to_buffer(symbol: str, bids: list, asks: list, ts_ms: int, market: 
 
 def write_md_from_ob_to_buffer(symbol: str, bids: list, asks: list, ts_ms: int, market: str):
     """Write MD key from orderbook.1 data (best bid/ask only)."""
-    global cmd_counter
     if not bids or not asks:
         return
     bid = bids[0][0]
@@ -236,7 +230,6 @@ def write_md_from_ob_to_buffer(symbol: str, bids: list, asks: list, ts_ms: int, 
     batch_buffer[key] = {"b": bid, "a": ask, "ts": str(ts_ms)}
     if key not in buffer_write_ts:
         buffer_write_ts[key] = time.monotonic()
-    cmd_counter += 1
 
     if config.HISTORY_ENABLED:
         chunk_id = int(ts_ms / 1000 / config.CHUNK_DURATION)
@@ -245,7 +238,6 @@ def write_md_from_ob_to_buffer(symbol: str, bids: list, asks: list, ts_ms: int, 
 
 
 def write_fr_to_buffer(symbol: str, rate: str, fr_ts_ms: str):
-    global cmd_counter
     # Cache fr_ts_ms when present (delta updates omit nextFundingTime)
     if fr_ts_ms:
         _fr_ts_cache[symbol] = fr_ts_ms
@@ -259,7 +251,6 @@ def write_fr_to_buffer(symbol: str, rate: str, fr_ts_ms: str):
     batch_buffer[key] = fields
     if key not in buffer_write_ts:
         buffer_write_ts[key] = time.monotonic()
-    cmd_counter += 1
 
     if config.HISTORY_ENABLED and effective_fr_ts:
         chunk_id = int(ts_ms / 1000 / config.CHUNK_DURATION)
@@ -287,7 +278,6 @@ async def _ws_task(url: str, symbols: list[str], label: str, market: str,
     """
     Single WS connection: subscribe in chunks of chunk_size per message.
     """
-    global cmd_counter
     backoff = config.WS_RECONNECT_INIT
 
     while True:
@@ -327,8 +317,6 @@ async def _ws_task(url: str, symbols: list[str], label: str, market: str,
                                 write_fr_to_buffer(*fr_result)
                                 stats["fr_msgs"] += 1
 
-                        if cmd_counter >= config.BATCH_MAX_COMMANDS:
-                            flush_event.set()
                 finally:
                     hb_task.cancel()
 
@@ -393,7 +381,6 @@ async def task_ob_fut(symbols: list[str]):
 # ── Flusher (primary: hset only) ───────────────────────────────────────────
 
 async def task_flusher(redis: aioredis.Redis):
-    global cmd_counter
 
     while True:
         try:
@@ -410,7 +397,6 @@ async def task_flusher(redis: aioredis.Redis):
 
         current_batch = batch_buffer.copy()
         batch_buffer.clear()
-        cmd_counter = 0
 
         # measure age of oldest pending entry before flushing
         if buffer_write_ts:
