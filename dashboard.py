@@ -151,7 +151,7 @@ class DashboardApp(App):
 
     def _build_redis(self) -> Panel:
         r   = self._state.redis
-        ok  = r.last_update_ts > 0 and (time.monotonic() - r.last_update_ts) < 90
+        ok  = r.last_update_ts > 0 and (time.monotonic() - r.last_update_ts) < 60
 
         def v(val, fmt, warn=None) -> Text:
             s = fmt.format(val)
@@ -176,7 +176,7 @@ class DashboardApp(App):
         state = self._state
         rows  = []
         for name, lv in state.monitors.items():
-            alive = lv.last_write_ts > 0 and (now - lv.last_write_ts) < 90
+            alive = lv.last_write_ts > 0 and (now - lv.last_write_ts) < 60
             sym   = Text("✓ ", style="bold green") if alive else Text("✗ ", style="bold red")
             rows.append(Text.assemble(sym, name))
 
