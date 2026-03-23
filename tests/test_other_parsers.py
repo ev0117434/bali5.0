@@ -398,3 +398,43 @@ class TestBitgetParsers:
         _, got_bids, got_asks, _ = result
         assert len(got_bids) == 10
         assert len(got_asks) == 10
+
+
+# ──────────────────────────────────────────────────────────────────────────
+# Stats dict tests — one per collector
+# ──────────────────────────────────────────────────────────────────────────
+
+_REQUIRED_NEW_FIELDS = [
+    "parse_errors", "parse_lat_sum", "parse_lat_max",
+    "flush_slow_count", "hist_flush_slow_count",
+    "buffer_age_sum", "buffer_age_max",
+    "e2e_lat_sum", "e2e_lat_max", "e2e_lat_count",
+]
+
+
+class TestCollectorBybitStats:
+    def test_stats_dict_has_new_fields(self):
+        from collectors.collector_bybit import stats
+        for field in _REQUIRED_NEW_FIELDS:
+            assert field in stats, f"Missing stats field: {field}"
+
+
+class TestCollectorOkxStats:
+    def test_stats_dict_has_new_fields(self):
+        from collectors.collector_okx import stats
+        for field in _REQUIRED_NEW_FIELDS:
+            assert field in stats, f"Missing stats field: {field}"
+
+
+class TestCollectorGateStats:
+    def test_stats_dict_has_new_fields(self):
+        from collectors.collector_gate import stats
+        for field in _REQUIRED_NEW_FIELDS:
+            assert field in stats, f"Missing stats field: {field}"
+
+
+class TestCollectorBitgetStats:
+    def test_stats_dict_has_new_fields(self):
+        from collectors.collector_bitget import stats
+        for field in _REQUIRED_NEW_FIELDS:
+            assert field in stats, f"Missing stats field: {field}"
