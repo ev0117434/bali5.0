@@ -25,13 +25,17 @@ log = setup_logger("stale_monitor")
 
 STALE_THRESHOLD_MS = config.STALE_THRESHOLD_SECONDS * 1000
 
+_COMPONENT = "stale_monitor"
+
+
+def _evt(event: str, **kwargs) -> dict:
+    return {"ts": int(time.time() * 1000), "component": _COMPONENT, "event": event, **kwargs}
+
 
 async def monitor_loop(redis: aioredis.Redis):
-    log.info(
-        f"Stale monitor started | "
-        f"threshold={config.STALE_THRESHOLD_SECONDS}s "
-        f"interval={config.STALE_CHECK_INTERVAL}s"
-    )
+    log.info(_evt("stale_monitor_start",
+                  threshold_s=config.STALE_THRESHOLD_SECONDS,
+                  interval_s=config.STALE_CHECK_INTERVAL))
 
     while True:
         t_start   = time.monotonic()
@@ -46,10 +50,10 @@ async def monitor_loop(redis: aioredis.Redis):
             try:
                 ts_raw = await redis.hget(key, "ts")
             except aioredis.ResponseError:
-                log.debug(f"Key {key.decode()} is not a hash, skipping")
+                log.debug(_evt("key_skip", key=key.decode(), reason="not_a_hash"))
                 continue
             if ts_raw is None:
-                log.debug(f"Key {key.decode()} has no ts field")
+                log.debug(_evt("key_skip", key=key.decode(), reason="no_ts_field"))
                 continue
             try:
                 ts     = int(ts_raw)
@@ -57,19 +61,20 @@ async def monitor_loop(redis: aioredis.Redis):
                 if age_ms > STALE_THRESHOLD_MS:
                     age_s = age_ms / 1000
                     stale.append((key.decode(), age_s))
-                    log.warning(
-                        f"STALE | key={key.decode()} "
-                        f"age={age_s:.0f}s last_ts={ts}"
-                    )
+                    log.warning(_evt("stale_key",
+                                     key=key.decode(),
+                                     age_s=round(age_s, 0),
+                                     last_ts=ts,
+                                     threshold_s=config.STALE_THRESHOLD_SECONDS))
             except (ValueError, TypeError) as exc:
-                log.debug(f"Key {key.decode()} ts parse error: {exc}")
+                log.debug(_evt("key_skip", key=key.decode(), reason="ts_parse_error", error_msg=str(exc)))
 
         elapsed_ms = (time.monotonic() - t_start) * 1000
-        log.info(
-            f"Stale check done: "
-            f"total_keys={total} stale={len(stale)} "
-            f"elapsed={elapsed_ms:.0f}ms"
-        )
+        log.info(_evt("stale_scan",
+                      total_keys=total,
+                      stale_keys=len(stale),
+                      scan_lat_ms=round(elapsed_ms, 0),
+                      threshold_s=config.STALE_THRESHOLD_SECONDS))
 
         await asyncio.sleep(config.STALE_CHECK_INTERVAL)
 
@@ -79,7 +84,7 @@ async def main():
     try:
         await monitor_loop(redis)
     except KeyboardInterrupt:
-        log.info("stale_monitor stopped")
+        log.info(_evt("stale_monitor_stop", reason="KeyboardInterrupt"))
     finally:
         await redis.aclose()
 
