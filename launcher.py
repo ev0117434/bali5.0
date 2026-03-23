@@ -83,6 +83,18 @@ def check_subscribe_files():
                 log.info(f"Subscribe file OK: {path} ({count} symbols)")
 
 
+def ensure_redis():
+    """Start Redis via setup script if not already running."""
+    script = Path(__file__).parent / "scripts" / "redis_setup.sh"
+    log.info(f"Running Redis setup: {script}")
+    result = subprocess.run(["bash", str(script)], capture_output=True, text=True)
+    if result.stdout:
+        log.info(result.stdout.strip())
+    if result.returncode != 0:
+        log.error(f"Redis setup script failed:\n{result.stderr}")
+        sys.exit(1)
+
+
 def start_process(name: str, script: str) -> subprocess.Popen:
     log.info(f"Starting {name} ({script})...")
     p = subprocess.Popen(
@@ -126,6 +138,7 @@ def main():
     signal.signal(signal.SIGINT,  handle_sigterm)
 
     # Pre-flight checks
+    ensure_redis()
     check_redis()
     os.makedirs(config.LOGS_DIR,    exist_ok=True)
     os.makedirs(config.SIGNAL_DIR,  exist_ok=True)
