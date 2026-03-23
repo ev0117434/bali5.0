@@ -13,10 +13,9 @@ HISTORY_ENABLED = True
 EXCHANGES = ["binance", "bybit", "okx", "gate", "bitget"]
 
 # ── Redis ──────────────────────────────────────────────────────────────────
-REDIS_HOST = "localhost"
-REDIS_PORT = 6379
-REDIS_DB   = 0
-REDIS_URL  = f"redis://{REDIS_HOST}:{REDIS_PORT}/{REDIS_DB}"
+REDIS_SOCKET_PATH = "/root/bali5.0/redis.sock"
+REDIS_DB          = 0
+REDIS_URL         = f"unix://{REDIS_SOCKET_PATH}?db={REDIS_DB}"
 
 # ── Батчинг коллекторов ────────────────────────────────────────────────────
 BATCH_FLUSH_INTERVAL_MS = 250   # мс: макс время до следующего flush
