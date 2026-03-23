@@ -74,6 +74,7 @@ def test_logger_format(tmp_path, monkeypatch):
 
 
 def test_redis_connection():
+    import pytest
     import redis       # redis is NOT imported at module level in this file
     import config
     try:
