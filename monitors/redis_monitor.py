@@ -24,15 +24,19 @@ from logger_setup import setup_logger
 
 log = setup_logger("redis_monitor")
 
+_COMPONENT = "redis_monitor"
+
+
+def _evt(event: str, **kwargs) -> dict:
+    return {"ts": int(time.time() * 1000), "component": _COMPONENT, "event": event, **kwargs}
+
 
 async def monitor_loop(redis: aioredis.Redis):
-    log.info(
-        f"Redis monitor started | "
-        f"interval={config.REDIS_CHECK_INTERVAL}s "
-        f"mem_warn={config.REDIS_MEMORY_WARN_MB}MB "
-        f"ops_warn={config.REDIS_OPS_WARN_PER_SEC}/s "
-        f"frag_warn=1.5"
-    )
+    log.info(_evt("redis_monitor_start",
+                  interval_s=config.REDIS_CHECK_INTERVAL,
+                  memory_warn_mb=config.REDIS_MEMORY_WARN_MB,
+                  ops_warn_per_sec=config.REDIS_OPS_WARN_PER_SEC,
+                  frag_warn=1.5))
 
     while True:
         t_start = time.monotonic()
@@ -67,32 +71,40 @@ async def monitor_loop(redis: aioredis.Redis):
 
             elapsed_ms = (time.monotonic() - t_start) * 1000
 
-            log.info(
-                f"REDIS OK | "
-                f"mem={mem_mb:.1f}MB rss={mem_rss_mb:.1f}MB frag={frag_ratio:.2f} "
-                f"peak={mem_peak_mb:.1f}MB | "
-                f"ops/s={ops_sec} clients={clients} blocked={blocked} | "
-                f"keys={total_keys} hit_rate={hit_rate:.1f}% | "
-                f"net_in={net_in_kbps:.0f}kbps net_out={net_out_kbps:.0f}kbps | "
-                f"eventloop={el_us}us "
-                f"lpush_p99={lpush_p99}us hset_p99={hset_p99}us | "
-                f"ping={elapsed_ms:.1f}ms"
-            )
-
+            warnings = []
             if mem_mb > config.REDIS_MEMORY_WARN_MB:
-                log.warning(f"Redis memory high: {mem_mb:.0f}MB > {config.REDIS_MEMORY_WARN_MB}MB")
-
+                warnings.append("memory_high")
             if ops_sec > config.REDIS_OPS_WARN_PER_SEC:
-                log.warning(f"Redis ops/sec high: {ops_sec} > {config.REDIS_OPS_WARN_PER_SEC}")
-
+                warnings.append("ops_high")
             if frag_ratio > 1.5:
-                log.warning(f"Redis fragmentation high: {frag_ratio:.2f}")
+                warnings.append("fragmentation_high")
+            if blocked > config.REDIS_BLOCKED_WARN_THRESHOLD:
+                warnings.append("blocked_clients")
 
-            if blocked > 0:
-                log.warning(f"Redis blocked clients: {blocked}")
+            log.info(_evt("redis_health",
+                status="warn" if warnings else "ok",
+                memory={"used_mb": round(mem_mb, 1), "rss_mb": round(mem_rss_mb, 1),
+                        "peak_mb": round(mem_peak_mb, 1), "frag_ratio": round(frag_ratio, 2)},
+                ops={"per_sec": ops_sec, "clients": clients, "blocked": blocked,
+                     "keys": total_keys, "hit_rate_pct": round(hit_rate, 1)},
+                network={"in_kbps": int(net_in_kbps), "out_kbps": int(net_out_kbps)},
+                latency={"ping_ms": round(elapsed_ms, 1), "eventloop_us": el_us,
+                         "lpush_p99_us": lpush_p99, "hset_p99_us": hset_p99},
+                warnings=warnings))
+
+            for w in warnings:
+                value = {"memory_high": mem_mb, "ops_high": float(ops_sec),
+                         "fragmentation_high": frag_ratio, "blocked_clients": float(blocked)}[w]
+                threshold = {"memory_high": float(config.REDIS_MEMORY_WARN_MB),
+                             "ops_high": float(config.REDIS_OPS_WARN_PER_SEC),
+                             "fragmentation_high": 1.5,
+                             "blocked_clients": float(config.REDIS_BLOCKED_WARN_THRESHOLD)}[w]
+                log.warning(_evt("redis_warn", warning=w,
+                                 value=round(value, 2), threshold=threshold))
 
         except Exception as exc:
-            log.error(f"Redis UNREACHABLE: {exc}")
+            log.error(_evt("redis_unreachable",
+                           error_type=type(exc).__name__, error_msg=str(exc)))
 
         await asyncio.sleep(config.REDIS_CHECK_INTERVAL)
 
@@ -102,7 +114,7 @@ async def main():
     try:
         await monitor_loop(redis)
     except KeyboardInterrupt:
-        log.info("redis_monitor stopped")
+        log.info(_evt("redis_monitor_stop", reason="KeyboardInterrupt"))
     finally:
         await redis.aclose()
 
