@@ -109,25 +109,20 @@ PROCESSES = {
     "spread_monitor":    ["python", "monitors/spread_monitor.py"],
 }
 
-# Restart tracking (предотвращает restart loop)
+# Restart tracking
 restart_counts = {name: 0 for name in PROCESSES}
-MAX_RESTARTS = 10  # после 10 restart подряд — не перезапускать, лог ERROR
 
 def health_check(procs):
     for name, p in list(procs.items()):
         if p.poll() is not None:  # процесс завершился
-            exit_code = p.poll()
-            log.error(f"Process {name} exited (code={exit_code})")
-
-            if restart_counts[name] >= MAX_RESTARTS:
-                log.error(f"Process {name} exceeded max restarts ({MAX_RESTARTS}). Not restarting.")
-                continue
-
             restart_counts[name] += 1
-            cmd = PROCESSES[name]
-            new_p = subprocess.Popen(cmd, ...)
+            log.error(
+                f"Process {name} (PID={p.pid}) died "
+                f"(exit={p.returncode}) — "
+                f"restarting (attempt #{restart_counts[name]})..."
+            )
+            new_p = subprocess.Popen(...)
             procs[name] = new_p
-            log.info(f"Restarted {name} (attempt {restart_counts[name]}) PID={new_p.pid}")
 ```
 
 ---

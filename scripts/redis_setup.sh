@@ -19,7 +19,10 @@ if redis-cli -s "$SOCKET" ping 2>/dev/null | grep -q PONG; then
     exit 0
 fi
 
-# 3. Start Redis with our config (daemonize yes is set in redis.conf)
+# 3. Remove stale socket file if it exists (left by a crashed Redis process)
+rm -f "$SOCKET"
+
+# 4. Start Redis with our config (daemonize yes is set in redis.conf)
 echo "[redis_setup] Starting Redis: redis-server $CONF"
 redis-server "$CONF"
 
